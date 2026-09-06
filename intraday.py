@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""美股日内 T 信号引擎 — 15/60 分钟 K + RSI/MACD/EMA 三共振。
+"""美股日内 T 信号引擎 — 60/15 分钟 K + RSI/MACD/EMA 三共振。
 
 子命令：
   scan <代码...>          扫描信号（可多只）
@@ -11,8 +11,11 @@
 信号基于**已闭合**的最后一根 K 线（防 repainting：盘中正在形成的 K 线
 指标会反复变化，与回测口径不一致）。
 
-止损锚定成本价（entry-anchored），不以当前价漂移。
+止损：锚定成本价（entry-anchored）且**建仓时一次锁定**——
+position 记录 stop_px / entry_atr，此后扫描直接读取锁定值，
+不随价格或波动率漂移，与回测引擎的入场锚定完全一致。
 """
+
 from __future__ import annotations
 
 import argparse
@@ -32,14 +35,14 @@ import pandas as pd  # noqa: E402
 from indicators import enrich, crossed  # noqa: E402
 
 CACHE_DIR = Path(os.environ.get("INTRADAY_CACHE", "/tmp/invest-intraday"))
-CACHE_TTL = 300  # 15m K 线本身 5 分钟一根，缓存 5 分钟足够
+CACHE_TTL = 300  # K 线 5 分钟一根，缓存 5 分钟足够
 
 POSITIONS_FILE = Path(
-    os.environ.get("INTRADAY_POSITIONS", Path(__file__).resolve().parent / "positions.json")
+    os.environ.get("INTRADAY_POSITIONS", "/Users/winhok/project/investment/positions.json")
 )
 
 DEFAULT_PERIOD = "10d"
-DEFAULT_INTERVAL = "15m"
+DEFAULT_INTERVAL = "60m"   # 与 strategy.md 统一：60m 主用，15m 观察
 STOP_LOSS_PCT = 0.03  # 固定止损 -3%
 ATR_MULT = 1.5        # ATR 止损倍数
 CROSS_LOOKBACK = 3    # 金叉/死叉在最近 3 根内算有效
@@ -89,7 +92,8 @@ def fetch(symbol: str, period: str | None = None,
         import yfinance as yf
     except ImportError as e:
         raise RuntimeError(
-            f"未安装 yfinance，请先：pip install -r requirements.txt ({e})"
+            f"未安装 yfinance，请用 invest-cli 的 venv："
+            f"~/.workbuddy/skills/invest-cli/.venv/bin/python ({e})"
         )
 
     df = yf.Ticker(symbol.upper()).history(period=period, interval=interval, auto_adjust=True)
@@ -163,6 +167,9 @@ def evaluate(df: pd.DataFrame, min_score: int = 3) -> dict:
         else:
             score, checks = bear_score, bear_checks
 
+    # 展示方向（决定 trend 条件的 label：EMA9>21 还是 EMA9<21）
+    direction = "bull" if checks is bull_checks else "bear"
+
     price = float(last["Close"])
     atr_val = float(last["atr"]) if pd.notna(last["atr"]) else None
 
@@ -180,6 +187,7 @@ def evaluate(df: pd.DataFrame, min_score: int = 3) -> dict:
         },
         "signal": {
             "side": side,
+            "direction": direction,
             "score": score,
             "strength": "strong" if score == 3 else ("weak" if score == 2 else "none"),
             "checks": checks,
@@ -215,13 +223,31 @@ def save_positions(data: dict) -> None:
     )
 
 
+def lock_stop(pos: dict, atr_val: float | None) -> dict:
+    """为持仓锁定止损位（幂等）：只在缺少 stop_px 时计算并写入。
+
+    锁定规则与回测引擎一致：
+      ATR 止损 = cost − 1.5 × 当时 ATR（无 ATR 时退化为固定止损）
+      固定止损 = cost × (1 − 3%)
+    锁定后永不再重算——价格和波动率变化都不影响已锁定的止损位。
+    旧版 position 记录（无 stop_px）会在下一次扫描时首次锁定。
+    """
+    if "stop_px" in pos:
+        return pos
+    cost = float(pos.get("cost", 0))
+    if atr_val:
+        pos["entry_atr"] = round(atr_val, 2)
+        pos["stop_px"] = round(cost - ATR_MULT * atr_val, 2)
+    else:
+        pos["stop_px"] = round(cost * (1 - STOP_LOSS_PCT), 2)
+    return pos
+
+
 def with_advice(res: dict, pos: dict | None) -> dict:
     """把持仓状态合并成一句可执行的动作建议。
 
-    止损锚定：持仓止损以**成本价**为锚（entry-anchored）——
-      固定止损 = cost × (1 - 3%)
-      ATR 止损  = cost − 1.5 × 当前ATR（ATR 取当前值；严格版应在建仓时锁定入场 ATR）
-    无持仓时展示的是"若现在建仓"的参考止损（基于现价）。
+    止损：直接读取持仓记录中**已锁定**的 stop_px（建仓时一次设定）。
+    无持仓时展示的是"若现在建仓"的参考止损（基于现价，未锁定）。
     """
     side, strength = res["signal"]["side"], res["signal"]["strength"]
     price = res["price"]
@@ -229,14 +255,11 @@ def with_advice(res: dict, pos: dict | None) -> dict:
     if pos:
         shares, cost = pos.get("shares", 0), float(pos.get("cost", 0))
         pnl = (price - cost) / cost if cost else 0.0
-        atr_val = res["indicators"]["atr"]
-        # 成本锚定的持仓止损（不再跟随现价漂移）
-        stop_fixed = cost * (1 - STOP_LOSS_PCT)
-        stop_atr = (cost - ATR_MULT * atr_val) if atr_val else None
-        stop = stop_atr or stop_fixed
-        res["risk"]["position_stop_fixed"] = round(stop_fixed, 2)
-        if stop_atr:
-            res["risk"]["position_stop_atr"] = round(stop_atr, 2)
+        # 已锁定的止损位：不随价格/ATR 漂移（与回测口径一致）
+        stop = float(pos["stop_px"])
+        res["risk"]["position_stop_locked"] = round(stop, 2)
+        if pos.get("entry_atr"):
+            res["risk"]["position_entry_atr"] = pos["entry_atr"]
 
         res["position"] = {
             "shares": shares, "cost": round(cost, 2),
@@ -246,22 +269,22 @@ def with_advice(res: dict, pos: dict | None) -> dict:
         }
 
         if price <= stop:
-            res["advice"] = f"触发止损：现价 {price} 已跌破成本锚定止损位 {round(stop,2)}（成本 {cost}），优先离场，不等共振"
+            res["advice"] = f"触发止损：现价 {price} 已跌破锁定止损位 {stop}（成本 {cost}），优先离场，不等共振"
             res["action"] = "stop_loss"
         elif side == "buy" and strength == "strong":
             res["advice"] = f"趋势与动量共振，可在 {res['risk']['add_ref']} 附近加仓（现浮盈 {pnl*100:.1f}%）"
             res["action"] = "add"
         elif side == "buy" and strength == "weak":
-            res["advice"] = f"两条件成立（{_missing(res)}），建议半仓加或等第三条件；止损位 {round(stop,2)}"
+            res["advice"] = f"两条件成立（{_missing(res)}），建议半仓加或等第三条件；止损位 {stop}"
             res["action"] = "add_half"
         elif side == "sell" and strength == "strong":
             res["advice"] = f"三条件转空，建议减仓/清仓，落袋 {pnl*100:.1f}%"
             res["action"] = "reduce"
         elif side == "sell" and strength == "weak":
-            res["advice"] = f"部分转空（{_missing(res)}），可减半仓，跌破 {round(stop,2)} 全出"
+            res["advice"] = f"部分转空（{_missing(res)}），可减半仓，跌破 {stop} 全出"
             res["action"] = "reduce_half"
         else:
-            res["advice"] = f"无明确信号，持有观察；止损位 {round(stop,2)}（成本锚定）"
+            res["advice"] = f"无明确信号，持有观察；止损位 {stop}（建仓时锁定，不漂移）"
             res["action"] = "hold"
     else:
         res["position"] = None
@@ -289,18 +312,21 @@ def _missing(res: dict) -> str:
 
 # ---------------------------------------------------------------- 输出层
 
-_LABEL = {"trend": "EMA9>21", "momentum": "MACD", "rsi_ok": "RSI"}
+_LABEL = {"momentum": "MACD", "rsi_ok": "RSI"}
+_TREND_LABEL = {"bull": "EMA9>21", "bear": "EMA9<21"}
 
 
 def format_terminal(res: dict) -> str:
     ind, sig, rk = res["indicators"], res["signal"], res["risk"]
     side_cn = {"buy": "加仓/买入", "sell": "卖出/减仓", "hold": "观望"}[sig["side"]]
     mark = {"strong": "★★★ 强", "weak": "★★☆ 中", "none": "★☆☆ 弱"}[sig["strength"]]
+    # trend 条件的 label 跟随展示方向（bear 侧显示 EMA9<21）
+    labels = {"trend": _TREND_LABEL.get(sig.get("direction"), "EMA 排列"), **_LABEL}
 
     L = [
         "",
         "=" * 62,
-        f"  {res['symbol']}  —  {res.get('interval', '15m')} 信号   {side_cn}  {mark}",
+        f"  {res['symbol']}  —  {res.get('interval', '60m')} 信号   {side_cn}  {mark}",
         f"  数据截至 {res['as_of']} 美东  |  共 {res['bars']} 根 K 线",
         "=" * 62,
         f"  现价        {res['price']}",
@@ -312,7 +338,7 @@ def format_terminal(res: dict) -> str:
         "  共振条件",
     ]
     for k, v in sig["checks"].items():
-        L.append(f"    [{'x' if v else ' '}] {_LABEL[k]}")
+        L.append(f"    [{'x' if v else ' '}] {labels[k]}")
     cd = sig["cross_detail"]
     if cd["golden_cross"]:
         L.append(f"    · MACD 金叉发生在 {cd['golden_bars_ago']} 根前")
@@ -332,9 +358,9 @@ def format_terminal(res: dict) -> str:
     if res.get("position"):
         L += [
             "",
-            "  风控（成本锚定）",
-            f"    固定止损(-3%)  {rk.get('position_stop_fixed', '—')}",
-            f"    ATR 止损(1.5x) {rk.get('position_stop_atr', '—')}",
+            "  风控（建仓时锁定，不漂移）",
+            f"    锁定止损位     {rk.get('position_stop_locked', '—')}"
+            + (f"（入场ATR {rk['position_entry_atr']}）" if rk.get("position_entry_atr") else ""),
             f"    加仓参考价     {rk['add_ref']}",
         ]
     else:
@@ -358,9 +384,10 @@ def format_terminal(res: dict) -> str:
 
 def cmd_scan(args):
     if args.min_score == 2:
-        print("⚠️  门槛 2：回测中交易次数约为门槛 3 的 14 倍、单笔质量显著下降，仅建议观察用",
+        print("⚠️  门槛 2 会显著增加交易频率与摩擦成本，回测 paired 对比多数基线劣于门槛 3，仅建议观察用",
               file=sys.stderr)
     positions = load_positions()
+    dirty = False
     results = []
     for sym in args.symbols:
         try:
@@ -369,11 +396,22 @@ def cmd_scan(args):
             res = evaluate(df, args.min_score)
             res["symbol"] = sym.upper()
             res["interval"] = args.interval
-            res = with_advice(res, positions.get(sym.upper()))
+            pos = positions.get(sym.upper())
+            if pos is not None:
+                # 首次见到无 stop_px 的旧持仓：按当时 ATR 锁定并持久化（幂等）
+                before = pos.get("stop_px")
+                pos = lock_stop(pos, res["indicators"]["atr"])
+                if pos.get("stop_px") != before:
+                    positions[sym.upper()] = pos
+                    dirty = True
+            res = with_advice(res, pos)
             res["ok"] = True
         except Exception as e:
             res = {"ok": False, "symbol": sym.upper(), "error": str(e)}
         results.append(res)
+
+    if dirty:
+        save_positions(positions)
 
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
@@ -427,12 +465,31 @@ def cmd_position(args):
         print()
         return 0
     if args.action == "add":
-        positions[args.symbol.upper()] = {
+        rec = {
             "shares": args.shares, "cost": args.cost,
             "note": args.note or "", "updated": time.strftime("%Y-%m-%d %H:%M"),
         }
+        if args.stop:
+            # 手动指定止损：直接锁定
+            rec["stop_px"] = args.stop
+        # 未指定时留空，下一次 scan 会按当时 ATR 计算并锁定（幂等）
+        positions[args.symbol.upper()] = rec
         save_positions(positions)
-        print(f"已记录 {args.symbol.upper()}：{args.shares} 股 @ {args.cost}")
+        if args.stop:
+            print(f"已记录 {args.symbol.upper()}：{args.shares} 股 @ {args.cost}，止损锁定 {args.stop}")
+        else:
+            print(f"已记录 {args.symbol.upper()}：{args.shares} 股 @ {args.cost}"
+                  f"（止损将在下次 scan 时按当时 ATR 锁定，可用 --stop 手动指定）")
+        return 0
+    if args.action == "set-stop":
+        sym = args.symbol.upper()
+        if sym not in positions:
+            print(f"未找到 {sym} 的持仓记录")
+            return 1
+        positions[sym]["stop_px"] = args.stop
+        positions[sym]["updated"] = time.strftime("%Y-%m-%d %H:%M")
+        save_positions(positions)
+        print(f"已更新 {sym} 止损 → {args.stop}（锁定）")
         return 0
     if args.action == "rm":
         positions.pop(args.symbol.upper(), None)
@@ -472,6 +529,10 @@ def main():
     a = pos_sub.add_parser("add")
     a.add_argument("symbol"); a.add_argument("shares", type=int); a.add_argument("cost", type=float)
     a.add_argument("--note", default="")
+    a.add_argument("--stop", type=float, default=None,
+                  help="手动指定止损价（直接锁定）；缺省时下次 scan 按当时 ATR 锁定")
+    st = pos_sub.add_parser("set-stop")
+    st.add_argument("symbol"); st.add_argument("stop", type=float)
     pos_sub.add_parser("list")
     r = pos_sub.add_parser("rm"); r.add_argument("symbol")
     pos.set_defaults(func=cmd_position)

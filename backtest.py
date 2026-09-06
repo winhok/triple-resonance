@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""三共振策略回测 v2 — 修复执行引擎 + 三段验证。
+"""三共振策略回测 v2.1 — 修复执行引擎 + 三段验证 + 口径统一。
+
+v2.1 修复（相对 v2，来自外部复审）：
+  A. 组合收益 / MaxDD / Sharpe 统一来源于同一条"段首等权重平衡"组合净值曲线
+     （每 sleeve 段内曲线 rebase 到段前收盘再平均），消除收益与风险指标
+     分属不同组合假设的口径漂移
+  B. B&H 对照集成同等风险指标：段首开盘买入（含成本）→ 段末收盘（含成本），
+     组合 MaxDD/Sharpe 与策略同口径可复现（此前只在临时脚本里算过）
+  C. 段内 PF/胜率/笔数明确标注 exit-cohort 口径（按本段退出的交易归属）
 
 v2 修复（相对 v1）：
   1. 入场当根 K 线也检查止损（v1 完全跳过入场 bar 的 Low）
@@ -290,18 +298,28 @@ def daily_sharpe(curve):
     return float(r.mean() / r.std() * np.sqrt(252))
 
 
-def portfolio_stats(per_symbol_eq, seg_range=None):
-    """组合层指标。seg_range: (ts_start, ts_end) 时间戳区间。"""
-    port = portfolio_curve(per_symbol_eq)
-    if seg_range is not None:
-        m = (port.index >= seg_range[0]) & (port.index < seg_range[1])
-        port = port[m]
+def portfolio_stats(curves):
+    """组合层指标：收益/MaxDD/Sharpe 全部来自同一条合成净值曲线。
+
+    curves: {sym: 段内已 rebase 的曲线}。对齐（ffill）后等权平均，
+    段首等权重平衡口径。
+    """
+    port = portfolio_curve(curves)
     dd = float((port / port.cummax() - 1).min()) if len(port) else 0.0
-    return {"curve": port, "max_dd": dd * 100, "sharpe": daily_sharpe(port)}
+    total = float(port.iloc[-1] / port.iloc[0] - 1) if len(port) else 0.0
+    return {"curve": port, "total_ret": total * 100,
+            "max_dd": dd * 100, "sharpe": daily_sharpe(port)}
 
 
 def evaluate_params(data, p, cost_bps):
-    """全量单遍回测，返回三段各自的组合级指标。"""
+    """全量单遍回测，返回三段各自的组合级指标。
+
+    口径统一（v2.1）：所有组合指标（收益/MaxDD/Sharpe）来源于同一条
+    "段首等权重平衡" 组合净值曲线 —— 每个 sleeve 段内曲线 rebase 到段前收盘，
+    再取平均。该定义下组合段收益 = mean(per-symbol 段收益)，且与
+    MaxDD/Sharpe 共用同一曲线，消除口径漂移。
+    B&H 对照用同样构造（段首开盘买入含成本、段末收盘含成本），风险指标同口径。
+    """
     per = {}
     for sym, df in data.items():
         try:
@@ -315,14 +333,11 @@ def evaluate_params(data, p, cost_bps):
     n_len = max(v[3] for v in per.values())
     out = {}
     for name, sf, ef in SEGS:
-        s = int(n_len * sf)
-        e = int(n_len * ef)
-        if e <= s + 5:
-            continue
-        # 段边界用各标的自身位置近似切（不同标的上市长度差异小，730d 全部覆盖）
         pooled = []
         per_symbol = {}
-        eqs = {}
+        strat_curves = {}   # 段内 rebase 后的策略 sleeve 曲线
+        bh_curves = {}      # 段内 B&H 曲线
+        c = cost_bps / 1e4
         for sym, (trades, eq, in_pos, ln) in per.items():
             ss = int(ln * sf)
             ee = max(int(ln * ef), ss + 5)
@@ -331,28 +346,41 @@ def evaluate_params(data, p, cost_bps):
                             ss, ee, cost_bps)
             pooled.extend([t["ret"] for t in m["_seg_trades"]])
             per_symbol[sym] = m
-            eqs[sym] = eq.iloc[ss:ee]
+            # 策略 sleeve：段内曲线 / 段前收盘权益 → 段首归一
+            base = float(eq.iloc[ss - 1]) if ss > 0 else 1.0
+            strat_curves[sym] = eq.iloc[ss:ee] / base
+            # B&H sleeve：段首开盘买入（含成本）→ 段内逐bar收盘净值，段末含卖出成本
+            o, cl = df_open_close_cache[sym]
+            seg_bh = pd.Series(cl[ss:ee], index=eq.index[ss:ee]) / (o[ss] * (1 + c))
+            seg_bh.iloc[-1] *= (1 - c)
+            bh_curves[sym] = seg_bh
 
         r = np.array(pooled, dtype=float)
-        port = portfolio_stats(eqs)
+        port = portfolio_stats(strat_curves)
+        bh_port = portfolio_stats(bh_curves)
         pos_syms = sum(1 for m in per_symbol.values() if m["total_ret"] > 0)
+        total_ret = float(np.mean([m["total_ret"] for m in per_symbol.values()]))
+        bh_total = float(bh_port["total_ret"])
 
         out[name] = {
+            # 以下为 exit-cohort 口径（按本段退出的交易归属，跨段交易的
+            # 全程盈亏计入其退出段）——不要当作纯段内入场交易统计
             "n_trades": len(pooled),
             "win_rate": float((r > 0).mean() * 100) if len(r) else 0.0,
             "avg_ret": float(r.mean() * 100) if len(r) else 0.0,
             "profit_factor": _pf(r),
             "avg_bars": float(np.mean([t["bars"] for m in per_symbol.values()
                                        for t in m["_seg_trades"]])) if pooled else 0.0,
-            # 组合收益：段内各 sleeve 曲线段末/段前 的平均（等权独立 sleeve 口径）
-            "total_ret": float(np.mean([m["total_ret"] for m in per_symbol.values()])),
-            "buy_hold": float(np.mean([m["buy_hold"] for m in per_symbol.values()])),
+            # 组合指标：收益/MaxDD/Sharpe 均来自同一条段首等权组合曲线
+            "total_ret": total_ret,
+            "buy_hold": bh_total,
+            "excess": float(total_ret - bh_total),
             "exposure": float(np.mean([m["exposure"] for m in per_symbol.values()])),
             "pos_symbols": pos_syms,
             "portfolio_max_dd": port["max_dd"],
             "portfolio_sharpe": port["sharpe"],
-            "excess": float(np.mean([m["total_ret"] for m in per_symbol.values()])
-                           - np.mean([m["buy_hold"] for m in per_symbol.values()])),
+            "bh_portfolio_max_dd": bh_port["max_dd"],
+            "bh_portfolio_sharpe": bh_port["sharpe"],
             "_per_symbol": per_symbol,
         }
     return out
@@ -475,16 +503,22 @@ def run_threeway(data, args):
     # ---- Stage 3: final 段一次性报告 ----
     fp = final_pick["_params"]
     f = final_pick.get("final", {})
-    print("\n【Stage 3 · final 段】最终一次性成绩（此前未用于任何选择）：", file=sys.stderr)
+    print("\n【Stage 3 · final 段】最终成绩（本轮 v2 未参与任何参数选择；", file=sys.stderr)
+    print("  但该时间段在 v1 实验中曾被查看，不属于严格 untouched forward test）：", file=sys.stderr)
     pf_s = "{:.2f}".format(f["profit_factor"]) if f.get("profit_factor", float("inf")) != float("inf") else "inf"
     print("  策略     组合收益 {:+.2f}% | 组合MaxDD {:.2f}% | Sharpe {} | Exposure {:.0f}%".format(
         f.get("total_ret", 0), f.get("portfolio_max_dd", 0),
         "{:.2f}".format(f["portfolio_sharpe"]) if f.get("portfolio_sharpe") else "n/a",
         f.get("exposure", 0)), file=sys.stderr)
+    print("  B&H      组合收益 {:+.2f}% | 组合MaxDD {:.2f}% | Sharpe {}".format(
+        f.get("buy_hold", 0), f.get("bh_portfolio_max_dd", 0),
+        "{:.2f}".format(f["bh_portfolio_sharpe"]) if f.get("bh_portfolio_sharpe") else "n/a"), file=sys.stderr)
+    print("  超额     {:+.2f}pp（同一组合口径；正负号在小差距下不做统计解读）".format(
+        f.get("excess", 0)), file=sys.stderr)
     print("  交易     {} 笔 | 胜率 {:.1f}% | PF {} | 平均持仓 {:.0f} 根K线".format(
-        f.get("n_trades", 0), f.get("win_rate", 0), pf_s, f.get("avg_bars", 0)), file=sys.stderr)
-    print("  对照     B&H {:+.2f}% | 超额 {:+.2f}% | 正收益标的 {}/{}".format(
-        f.get("buy_hold", 0), f.get("excess", 0),
+        f.get("n_trades", 0), f.get("win_rate", 0), pf_s, f.get("avg_bars", 0))
+        + "（exit-cohort 口径：按本段退出的交易归属）", file=sys.stderr)
+    print("  正收益标的 {}/{}".format(
         f.get("pos_symbols", 0), len(f.get("_per_symbol", {}))), file=sys.stderr)
 
     # ---- BASE 对照（同一 final 段）----

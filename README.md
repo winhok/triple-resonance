@@ -12,23 +12,25 @@
 
 - **三共振信号**：趋势（EMA9>EMA21）+ 动量（MACD 柱同向且近期金叉/死叉）+ RSI 位置，三条同时成立才算强信号；两条成立会明确告诉你**缺哪条**
 - **只用已闭合 K 线**：丢弃正在形成的 bar，杜绝信号重绘（回测/实盘口径一致）
-- **成本锚定止损**：止损位锚定你的持仓成本（成本×0.97 或 成本−1.5×ATR），现价跌破立即提示，不随价格漂移
-- **持仓联动**：记录持仓后自动算浮盈亏、市值、止损位，结论直接对应动作（建仓/加仓/减仓/止损/观望）
-- **内置回测引擎**：逐 bar 状态机、防前视、含交易成本、三段验证（train/validation/final），配有合成数据回归测试
+- **成本锚定止损**：止损位在**建仓时一次锁定**（成本 − 1.5×ATR，或手动指定），持久化保存——价格和波动率怎么变都不漂移，与回测引擎同口径
+- **持仓联动**：记录持仓后自动算浮盈亏、市值、锁定止损位，结论直接对应动作（建仓/加仓/减仓/止损/观望）
+- **内置回测引擎**：逐 bar 状态机、防前视、含交易成本、三段验证（train/validation/final），收益/MaxDD/Sharpe 统一组合口径，配有合成数据回归测试
 
 ## 快速开始
 
 ```bash
 pip install -r requirements.txt
 
-# 扫描信号（15m 观察，60m 为当前推荐周期）
-python intraday.py scan AAPL NVDA TSLA --interval 60m
+# 扫描信号（默认 60m；15m 观察用 --interval 15m）
+python intraday.py scan AAPL NVDA TSLA
 
 # 只看指标，不给建议
 python intraday.py quote AAPL
 
 # 记录持仓（之后扫描会自动联动止损/加减仓建议）
 python intraday.py position add AAPL 100 310.5 --note "底仓"
+python intraday.py position add AAPL 100 310.5 --stop 300   # 手动锁定止损价
+python intraday.py position set-stop AAPL 295               # 改锁定止损
 python intraday.py position list
 
 # 回测（60m / 2 年，含三段验证与成本敏感性）
@@ -43,18 +45,18 @@ python tests/test_backtest_engine.py
 | 方向 | 趋势 | 动量 | 位置 |
 |---|---|---|---|
 | 做多（buy） | EMA9 > EMA21 | MACD 柱 > 0 且近 3 根内金叉 | RSI 35–65 健康区，或从 <30 上穿回 30 |
-| 做空（sell） | EMA9 < EMA21 | MACD 柱 < 0 且近 3 根内死叉 | RSI ≥ 65，或从 >70 回落 |
+| 做空（sell） | EMA9 < EMA21 | MACD 柱 < 0 且近 3 根内死叉 | RSI > 65（严格，避免 65 同值双侧），或从 >70 回落 |
 
 3/3 强信号（建议执行）｜2/3 中等（半仓或等第三条）｜≤1 无信号（观望）。
 多空分数相同一律观望，不偏多。**持仓时止损优先于任何信号。**
 
 ## 回测现状（如实）
 
-详见 [docs/backtest-report-v2.md](docs/backtest-report-v2.md)。核心事实：
+详见 [docs/backtest-report-v2.md](docs/backtest-report-v2.md)（v2.1，组合口径统一后）。核心事实：
 
-- 60m + 门槛 3 在 final 验证段收益 +21.6%，与同期买入持有基本持平（无收益 alpha），但 MaxDD 与 Sharpe 略优（-12.7% vs -13.3%，1.40 vs 1.18）——**价值在风控而非超额收益**
+- 60m + 门槛 3 在 final 验证段收益 +21.6%，与同期等权 B&H 基本持平（无收益 alpha）；MaxDD/Sharpe 亦几乎相同——**目前没有证据支持超额收益**
 - 15m 当前未发现稳定样本外优势（数据窗口仅约 60 天，不下死刑结论）
-- 当前定位：**底仓持有 + 60m 信号管理加减仓 + 止损保护**。做 T 实时盘中打点依赖下面的 Roadmap
+- 当前定位：**底仓持有 + 60m 信号管理加减仓 + 锁定止损保护**。做 T 实时盘中打点依赖下面的 Roadmap
 
 ## Roadmap（做 T 全链路）
 

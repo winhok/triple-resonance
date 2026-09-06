@@ -1,11 +1,26 @@
 # triple-resonance v3 设计文档 — 底仓当日 T 系统
 
-> 状态：分阶段的施工蓝图。**P0 已实现**（纯本地仓位模型 + 单元测试，见下方 §10），
-> P1（Alpaca 接入）待用户启动。本文档其余章节为后续阶段的门槛与约束。
+> 状态：分阶段的施工蓝图。**P0 已实现**（领域模型 + 状态机 + Session + 定仓 + 本地 SQLite 状态库，
+> 纯本地、无数据依赖、36 项单测全 PASS，见 §10）。
 > v2.2 的结论（详见 [backtest-report-v2.md](backtest-report-v2.md)）是本设计的前提：
 > **"60m 三指标整仓择时"已被证伪为负贡献（final 超额 -8.44pp），
 > 且它本来就不是当日 T——平均持仓 22 个交易日的波段器被拿去验证"今天买今天卖"。**
 > v3 不是修指标参数，而是换结构。
+
+## 0.1 实施路线（复审后定稿）
+
+**领域边界先于数据源**：先锁死 `domain` 对象与状态机，再接 Alpaca。
+SDK 对象不允许渗透进策略/状态机层（见 §9 包结构）。P0 完成前不写一行 Alpaca API。
+
+```text
+P0  Domain + Session + T Bucket + Interfaces + StateStore   ✅ 已实现
+P1  Alpaca Historical 1m + Data Store（parquet，含 feed 元信息）
+P2  1m → 5m/15m 聚合（按 session 锚定）+ MarketContext + Setup A（纯函数）
+P3  Same-day Backtester（1m 事件引擎，A/B/C 三基准，Signal Contribution = C−B）
+P4  Alpaca Live WebSocket + Paper Execution（TradingClient，非 Broker API）
+P5  Forward Test
+P6  Setup B / Reverse T
+```
 
 ## 0. 设计原则
 
@@ -60,11 +75,26 @@
 | `t_max_shares` | 当日 T 仓上限（如底仓的 20%） |
 | `t_shares` | 当前 T 仓（0 ~ t_max_shares） |
 | `t_avg_cost` / `t_stop_px` | T 仓成本与结构止损（见 §5） |
-| `t_realized_pnl_today` | 今日 T 已实现盈亏 |
+| `daily_t_pnl` | 今日 T 已实现盈亏（reset_day 清零） |
+| `cumulative_t_pnl` | 跨日累计 T 盈亏（用于 effective_cost，**不清零**） |
 | `round_trips_today` | 今日 T 往返次数（适配日内交易限制，见 §8） |
-| `base_effective_cost` | 派生指标：base_cost × base_shares − 累计 T 盈利 ÷ (base_shares + …)，即"T 盈利折算后的底仓有效成本" |
 
-**不变式**：收盘后 `t_shares == 0`（T_FLATTEN 强制，见 §6）。
+**两个成本字段必须严格区分**（用户 P0 复审重点纠正）：
+
+```text
+broker_cost_basis       = base_cost × base_shares        # 券商/税务口径，T 盈亏绝不写回它
+effective_cost_after_t  = (base_cost × base_shares − cumulative_t_pnl) / base_shares
+                                                          # 系统内部"经济等效成本"，仅研究指标
+```
+
+例：100 股 @150，累计 T 盈利 +600 → effective_cost = (15000 − 600)/100 = 144。
+`broker_cost_basis` 仍为 15000，不受 T 影响。对账务必以 `broker_cost_basis` 为准。
+
+**不变式**（由 `portfolio.t_bucket.TBucketEngine` 保证，见 tests/test_t_bucket.py）：
+1. `total = base_shares + t_shares` 恒成立，且 `total >= base_shares`（T 引擎碰不到 base）
+2. `t_shares >= 0` 且 `<= t_max_shares`
+3. 收盘（force_flatten）后 `t_shares == 0`
+4. T 盈亏只写 `daily_t_pnl` / `cumulative_t_pnl`，`base_cost` 原字段永不被修改
 
 ## 3. 时间框架与管线
 
@@ -141,12 +171,17 @@ size = 允许亏损金额 ÷ (entry − stop)
 ## 6. 当日强制平仓（不可关闭）
 
 ```
-15:45 ET（可配置 15:45–15:50 窗口）
+force_flatten_at = close_at − 15min        # 见 §3 Session 模型
   ↓
-T_FLATTEN：卖出/买回全部 t_shares
+T_FLATTEN：卖出全部 t_shares
   ↓
-t_shares = 0（当日不再开 T）
+t_shares = 0，t_flattened = True（当日不再开 T）
 ```
+
+- **15:45 不写死**：由 `session.force_flatten_at` 派生。提前收盘日（如 13:00 ET 收）自动变成 12:45。
+- `domain.session.MarketSession` 由 `open_at`/`close_at` 派生 `opening_range_end`(open+15m)、
+  `entry_cutoff`(close−30min)、`force_flatten_at`(close−15min)；`BacktestSessionProvider` 注入
+  early_closes 表，`AlpacaSessionProvider`（P4）接 `get_calendar()/get_clock()`。
 
 这条规则的存在理由：v2.x 的教训——"今天做 T → 套住 → 明天再等等 →
 变成 22 天波段仓"。状态机层面禁止 T 仓过夜，不依赖自律。
@@ -200,40 +235,58 @@ broker/account adapter 的配置项（`round_trips_limit`），**引擎不硬编
 ## 9. 目录结构（演进目标）
 
 ```
-data/
-  historical.py      # 1m 历史拉取与缓存
-  live.py            # WebSocket 接入（Alpaca 优先）
-strategy/
-  context.py         # MarketContext: OR / VWAP / SPY / RS
-  trend_pullback.py  # Setup A（v3 MVP）
-  reverse_t.py       # Setup B（后置，独立回测）
-portfolio/
-  base_position.py   # 底仓（T 引擎不可动）
-  t_bucket.py        # T 仓状态机 + 当日 PnL + flatten
-risk/
-  position_size.py   # 定仓公式
-  stop.py            # 结构止损 + v2.x 锁定止损（保留）
-execution/
-  paper.py           # 纸面成交（先跑通）
-  broker.py          # 券商下单（Alpaca）
-backtest/
-  intraday.py        # 1m 粒度回测，继承 v2.2 实验设计
-intraday.py          # 过渡期：现有观察引擎（保留至 v3 主体可用）
-backtest.py          # v2.2 回测（保留作历史基线）
+triple_resonance/
+├── domain/
+│   ├── models.py        # Bar / TBucket / MarketContext / SetupSignal / OrderIntent / Fill / RiskDecision
+│   ├── session.py        # MarketSession + SessionProvider（Backtest/Alpaca 两实现）
+│   └── events.py         # TTrade / SystemEvent（状态库落盘用）
+├── data/
+│   ├── protocol.py       # HistoricalProvider / LiveProvider（策略层只依赖接口）
+│   ├── alpaca_historical.py   # P1
+│   ├── alpaca_live.py          # P4
+│   └── parquet_store.py        # P1
+├── bars/
+│   └── aggregator.py     # P2：1m → 5m/15m（session 锚定）
+├── strategy/
+│   ├── protocol.py        # SetupDetector（纯函数 detect）
+│   ├── context.py         # P2：MarketContext
+│   └── trend_pullback.py  # P2：Setup A
+├── portfolio/
+│   └── t_bucket.py        # T bucket 状态机（P0 ✅）
+├── risk/
+│   ├── sizing.py          # 定仓公式（P0 ✅）
+│   └── stops.py           # 结构止损 + 锁定止损（P2）
+├── execution/
+│   ├── protocol.py        # ExecutionProvider
+│   ├── paper.py           # P4
+│   └── alpaca.py          # P4（命名 AlpacaExecutionAdapter，非 BrokerClient）
+├── state/
+│   └── sqlite.py          # 本地状态库 + reconcile（P0 ✅）
+└── backtest/
+    └── intraday.py        # P3：1m same-day 事件引擎
+
+# v2 legacy baseline（保留，不删）：
+intraday.py   backtest.py   indicators.py   # 旧三共振仅 observe；新回测在 backtest/intraday.py
 ```
 
 ## 10. 实施顺序（每步可独立验收）
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| P0 | t_bucket 仓位模型 + 当日 PnL/有效成本计算（纯本地，无数据依赖） | ✅ 单元测试 `tests/test_t_bucket.py`（24/24 PASS，2026-09-07）：`portfolio/base_position.py`·`portfolio/t_bucket.py`·`portfolio/portfolio.py` + `risk/position_size.py` |
-| P1 | Alpaca 数据接入（历史 1m + paper trading） | 拉 6 个月 NVDA/SPY 1m 数据成功 |
-| P2 | MarketContext（OR/VWAP/RS）+ Setup A 信号（纯计算，不下单） | 历史信号复盘：每笔 T 的 context/setup/trigger 可解释 |
-| P3 | 1m 回测引擎（继承 v2.2 实验设计） | 合成数据回归测试 + 通过 §7 门槛 |
-| P4 | paper execution（Alpaca paper） | 一周模拟盘，T 仓每日清零、无隔夜 |
-| P5 | 实盘（小仓）+ broker stop order | 用户确认后 |
+| P0 | Domain + Session + T Bucket + Interfaces + SQLite StateStore（纯本地，无数据依赖） | ✅ 36 项单测 PASS：`tests/test_t_bucket.py`(19)·`test_session.py`(4)·`test_position_sizing.py`(6)·`test_state_store.py`(7)。覆盖 7 条不变式 + effective_cost + 定仓 + reconcile |
+| P1 | Alpaca Historical 1m + Parquet Store（含 feed=IEX/SIP 元信息） | `python -m triple_resonance.data.download --symbols NVDA SPY --timeframe 1m` 落地 parquet，元信息可校验 |
+| P2 | 1m→5m/15m 聚合（session 锚定）+ MarketContext + Setup A（纯函数） | 合成/历史信号复盘：每笔 T 的 context/setup/trigger 可解释 |
+| P3 | 1m same-day Backtester（A/B/C 三基准，Signal Contribution=C−B） | 合成数据回归测试 + 通过 §7 门槛 |
+| P4 | Alpaca Live WebSocket + Paper Execution（TradingClient） | 一周模拟盘：T 仓每日清零、无隔夜、reconcile OK |
+| P5 | Forward Test | 用户确认后 |
+| P6 | Setup B / Reverse T | 独立回测通过后再加 |
 
 **在 P3 通过 §7 门槛之前，T_BUY/T_SELL 不恢复输出。**
+
+**P0 关键边界（已锁死）**：flatten 后当日禁止再开 T（隔夜保护）、stop≥entry 拒单、
+空仓卖出/重复入场拒单、费用计入净盈亏、`effective_cost_after_t` 数学正确、
+`broker_cost_basis` 永不被 T 修改、early-close 日 `force_flatten_at = close−15min`、
+`size = risk_budget/(entry−stop)`、`reconcile` 不一致即 BLOCK_TRADING。
 
 ---
 

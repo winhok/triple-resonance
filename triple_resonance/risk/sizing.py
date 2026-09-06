@@ -8,8 +8,8 @@ from __future__ import annotations
 
 
 def risk_based_size(risk_amount: float, entry: float, stop: float,
-                    max_shares: int, base_t_cap: int | None = None) -> int:
-    """返回应开 T 仓股数（向下取整，≥ 0）。
+                    max_shares: int, base_t_cap: Optional[int] = None) -> int:
+    """返回应开 T 仓股数（向下取整，>= 0）。
 
     risk_amount : 本次 T 最多允许亏损的金额（> 0）
     entry       : 计划入场价

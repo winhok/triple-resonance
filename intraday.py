@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-"""美股日内 T 信号引擎 — 60/15 分钟 K + RSI/MACD/EMA 三共振。
+"""美股盘面观察引擎 — 60/15 分钟 K + RSI/MACD/EMA 三共振（v3：观察模式）。
 
 子命令：
-  scan <代码...>          扫描信号（可多只）
-  quote <代码>            只看当前指标，不给建议
+  scan <代码...>          扫描共振状态（可多只）
+  quote <代码>            只看当前指标
   position add/list/rm    持仓管理
 
 数据：yfinance（与 invest-cli 共用 .venv）。K 线非实盘级，有延迟。
+yfinance 定位为研究工具：适合盘后复盘与粗粒度回测；
+实盘触发/止损成交应改用券商 WebSocket 与订单系统（见 docs/v3-design.md）。
+信号基于**已闭合**的最后一根 K 线（防 repainting）。
 
-信号基于**已闭合**的最后一根 K 线（防 repainting：盘中正在形成的 K 线
-指标会反复变化，与回测口径不一致）。
-
-止损：锚定成本价（entry-anchored）且**建仓时一次锁定**——
-position 记录 stop_px / entry_atr，此后扫描直接读取锁定值，
-不随价格或波动率漂移，与回测引擎的入场锚定完全一致。
+v3 语义（v2.2 段隔离回测：60m final 超额 -8.44pp，择时为负贡献）：
+  - **信号层只观察**：输出共振方向/分数/条件明细，action=observe/wait，
+    不再产生 加仓/减仓/建仓 建议——直到 same-day T overlay 通过回测
+  - **风险层保留**：止损位建仓时一次锁定（entry-anchored，position 记录
+    stop_px/entry_atr，只读不重算）；现价破位→stop_loss，
+    上根 Low 破位但收盘回升→stop_review（回测口径看盘中 Low）
 """
 
 from __future__ import annotations
@@ -247,13 +250,20 @@ def lock_stop(pos: dict, atr_val: float | None) -> dict:
 
 
 def with_advice(res: dict, pos: dict | None) -> dict:
-    """把持仓状态合并成一句可执行的动作建议。
+    """把持仓状态合并成当前状态摘要。
 
-    止损：直接读取持仓记录中**已锁定**的 stop_px（建仓时一次设定）。
-    无持仓时展示的是"若现在建仓"的参考止损（基于现价，未锁定）。
+    v3 语义（v2.2 段隔离回测结论：择时信号为负贡献，不作为加减仓依据）：
+      - 信号层**只观察**：输出共振方向与分数，action 一律 observe/wait，
+        不再产生 加仓/减仓/建仓 建议
+      - 风险层**保留**：止损位读取持仓记录中建仓时锁定的 stop_px；
+        现价破位 → stop_loss；上根 Low 破位但收盘回升 → stop_review
+    待 same-day T overlay（v3，见 docs/v3-design.md）通过回测后，
+    才恢复 T_BUY / T_SELL 动作。
     """
     side, strength = res["signal"]["side"], res["signal"]["strength"]
     price = res["price"]
+    # 方向标签跟随实际展示的 checks 侧（hold 时 checks 也跟随分数较高的一侧）
+    dir_cn = {"bull": "偏多", "bear": "偏空"}[res["signal"].get("direction", "bull")]
 
     if pos:
         shares, cost = pos.get("shares", 0), float(pos.get("cost", 0))
@@ -286,40 +296,22 @@ def with_advice(res: dict, pos: dict | None) -> dict:
             res["advice"] = (f"⚠ 上一根K线最低 {last_low} 已触及锁定止损 {stop}——回测口径下已触发离场；"
                              f"现价 {price} 回到止损上方，实时触发请依赖券商止损单，勿等下一次扫描")
             res["action"] = "stop_review"
-        elif side == "buy" and strength == "strong":
-            res["advice"] = f"趋势与动量共振，可在 {res['risk']['add_ref']} 附近加仓（现浮盈 {pnl*100:.1f}%）"
-            res["action"] = "add"
-        elif side == "buy" and strength == "weak":
-            res["advice"] = f"两条件成立（{_missing(res)}），建议半仓加或等第三条件；止损位 {stop}"
-            res["action"] = "add_half"
-        elif side == "sell" and strength == "strong":
-            res["advice"] = f"三条件转空，建议减仓/清仓，落袋 {pnl*100:.1f}%"
-            res["action"] = "reduce"
-        elif side == "sell" and strength == "weak":
-            res["advice"] = f"部分转空（{_missing(res)}），可减半仓，跌破 {stop} 全出"
-            res["action"] = "reduce_half"
         else:
-            res["advice"] = f"无明确信号，持有观察；止损位 {stop}（建仓时锁定，不漂移）"
-            res["action"] = "hold"
+            res["advice"] = (f"信号层仅观察（v2.2 回测：择时为负贡献，不作加减仓依据）："
+                             f"当前{dir_cn}共振 {res['signal'].get('score', '?')}/3；"
+                             f"止损位 {stop}（建仓时锁定，不漂移），实时触发依赖券商止损单")
+            res["action"] = "observe"
     else:
         res["position"] = None
-        # 无持仓时 risk 块是基于现价的"若建仓"参考止损
-        if side == "buy" and strength == "strong":
-            res["advice"] = f"三共振成立，可建仓，参考止损 {res['risk']['stop_loss_atr']}"
-            res["action"] = "open"
-        elif side == "buy" and strength == "weak":
-            res["advice"] = f"两条件成立（{_missing(res)}），可试仓半仓或等待"
-            res["action"] = "open_half"
-        elif side == "sell":
-            res["advice"] = "当前转空，空仓观望，不宜新开多"
-            res["action"] = "wait"
-        else:
-            res["advice"] = "无信号，观望"
-            res["action"] = "wait"
+        res["advice"] = (f"信号层仅观察：当前{dir_cn}共振 {res['signal'].get('score', '?')}/3，"
+                         "不构成建仓建议（v2.2 回测：择时为负贡献）；"
+                         "若建仓请自带独立依据并配合券商止损单")
+        res["action"] = "wait"
     return res
 
 
 def _missing(res: dict) -> str:
+    """共振条件缺项描述（供观察模式提示用）。"""
     names = {"trend": "EMA 排列", "momentum": "MACD", "rsi_ok": "RSI"}
     miss = [names[k] for k, v in res["signal"]["checks"].items() if not v]
     return "缺 " + "、".join(miss) if miss else "全满足"
@@ -333,7 +325,7 @@ _TREND_LABEL = {"bull": "EMA9>21", "bear": "EMA9<21"}
 
 def format_terminal(res: dict) -> str:
     ind, sig, rk = res["indicators"], res["signal"], res["risk"]
-    side_cn = {"buy": "加仓/买入", "sell": "卖出/减仓", "hold": "观望"}[sig["side"]]
+    side_cn = {"buy": "偏多共振", "sell": "偏空共振", "hold": "观望"}[sig["side"]]
     mark = {"strong": "★★★ 强", "weak": "★★☆ 中", "none": "★☆☆ 弱"}[sig["strength"]]
     # trend 条件的 label 跟随展示方向（bear 侧显示 EMA9<21）
     labels = {"trend": _TREND_LABEL.get(sig.get("direction"), "EMA 排列"), **_LABEL}
@@ -376,15 +368,15 @@ def format_terminal(res: dict) -> str:
             "  风控（建仓时锁定，不漂移）",
             f"    锁定止损位     {rk.get('position_stop_locked', '—')}"
             + (f"（入场ATR {rk['position_entry_atr']}）" if rk.get("position_entry_atr") else ""),
-            f"    加仓参考价     {rk['add_ref']}",
+            f"    EMA21 参考位   {rk['add_ref']}",
         ]
     else:
         L += [
             "",
-            "  风控（若建仓参考）",
+            "  风控（若建仓参考，仅信息展示）",
             f"    固定止损(-3%)  {rk['stop_loss_pct']}",
             f"    ATR 止损(1.5x) {rk['stop_loss_atr']}",
-            f"    加仓参考价     {rk['add_ref']}",
+            f"    EMA21 参考位   {rk['add_ref']}",
         ]
 
     L += [

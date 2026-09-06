@@ -217,12 +217,12 @@ def main():
             "indicators": {}}
     res2 = intraday.with_advice(res2, {"shares": 10, "cost": 350.0,
                                       "stop_px": 348.65, "entry_atr": 0.9})
-    t9c = "last_bar_low_breach" not in res2["risk"] and res2["action"] == "hold"
+    t9c = "last_bar_low_breach" not in res2["risk"] and res2["action"] == "observe"
     if not (t9a and t9b and t9c):
-        print(f"T9 FAIL：锁定幂等={t9a} Low触及告警={t9b} 未触及保持hold={t9c}")
+        print(f"T9 FAIL：锁定幂等={t9a} Low触及告警={t9b} 未触及保持observe={t9c}")
         ok = False
     else:
-        print("T9 PASS：止损锁定幂等（ATR 10.0 不改 348.65）；上根 Low 破位→stop_review；未触及→hold")
+        print("T9 PASS：止损锁定幂等（ATR 10.0 不改 348.65）；上根 Low 破位→stop_review；未触及→observe（信号层不产生加减仓建议）")
 
     print("\n" + ("全部通过 ✓" if ok else "存在失败 ✗"))
     return 0 if ok else 1

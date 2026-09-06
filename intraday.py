@@ -191,6 +191,7 @@ def evaluate(df: pd.DataFrame, min_score: int = 3) -> dict:
             "score": score,
             "strength": "strong" if score == 3 else ("weak" if score == 2 else "none"),
             "checks": checks,
+            "score_detail": {"bull": bull_score, "bear": bear_score},
             "cross_detail": {
                 "golden_cross": gold, "golden_bars_ago": gold_ago,
                 "death_cross": dead, "death_bars_ago": dead_ago,
@@ -201,6 +202,8 @@ def evaluate(df: pd.DataFrame, min_score: int = 3) -> dict:
             "stop_loss_pct": round(price * (1 - STOP_LOSS_PCT), 2),
             "stop_loss_atr": round(price - ATR_MULT * atr_val, 2) if atr_val else None,
             "add_ref": round(min(float(last["ema_slow"]), price * 0.995), 2),
+            # 最后一根已闭合 K 的最低价：用于事后检查"上根 Low 是否已触及止损"
+            "last_low": round(float(last["Low"]), 2),
         },
     }
 
@@ -261,6 +264,14 @@ def with_advice(res: dict, pos: dict | None) -> dict:
         if pos.get("entry_atr"):
             res["risk"]["position_entry_atr"] = pos["entry_atr"]
 
+        # 事后 Low 检查：回测的止损触发看的是盘中 Low，而这里只能用已闭合 K 的
+        # 收盘价判断——上根 Low 已破位但收盘回升时，回测口径下已离场。
+        # 实时触发必须依赖券商止损单/实时行情（yfinance 有延迟，只能事后发现）。
+        last_low = res["risk"].get("last_low")
+        low_breach = (last_low is not None and last_low <= stop < price)
+        if low_breach:
+            res["risk"]["last_bar_low_breach"] = True
+
         res["position"] = {
             "shares": shares, "cost": round(cost, 2),
             "price": price, "pnl_pct": round(pnl * 100, 2),
@@ -271,6 +282,10 @@ def with_advice(res: dict, pos: dict | None) -> dict:
         if price <= stop:
             res["advice"] = f"触发止损：现价 {price} 已跌破锁定止损位 {stop}（成本 {cost}），优先离场，不等共振"
             res["action"] = "stop_loss"
+        elif low_breach:
+            res["advice"] = (f"⚠ 上一根K线最低 {last_low} 已触及锁定止损 {stop}——回测口径下已触发离场；"
+                             f"现价 {price} 回到止损上方，实时触发请依赖券商止损单，勿等下一次扫描")
+            res["action"] = "stop_review"
         elif side == "buy" and strength == "strong":
             res["advice"] = f"趋势与动量共振，可在 {res['risk']['add_ref']} 附近加仓（现浮盈 {pnl*100:.1f}%）"
             res["action"] = "add"
@@ -447,7 +462,8 @@ def cmd_quote(args):
             print(f"\n{r['symbol']}  {r['price']}  ({r['as_of']} 美东, {r['bars']}根已闭合K线)")
             print(f"  RSI(14) {ind['rsi']}  MACD柱 {ind['macd_hist']}  "
                   f"EMA9/21 {ind['ema9']}/{ind['ema21']}  ATR {ind['atr']}")
-            print(f"  当前条件计数：多头 {sum(1 for v in sig['checks'].values() if v) if sig['side'] != 'sell' else 0}/3"
+            sd = sig.get("score_detail", {})
+            print(f"  条件计数：多头 {sd.get('bull', 0)}/3 | 偏空 {sd.get('bear', 0)}/3"
                   f"（信号判定见 scan，本命令不给建议）")
     return 0 if all(r["ok"] for r in results) else 1
 

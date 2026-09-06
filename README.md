@@ -14,7 +14,7 @@
 - **只用已闭合 K 线**：丢弃正在形成的 bar，杜绝信号重绘（回测/实盘口径一致）
 - **成本锚定止损**：止损位在**建仓时一次锁定**（成本 − 1.5×ATR，或手动指定），持久化保存——价格和波动率怎么变都不漂移，与回测引擎同口径
 - **持仓联动**：记录持仓后自动算浮盈亏、市值、锁定止损位，结论直接对应动作（建仓/加仓/减仓/止损/观望）
-- **内置回测引擎**：逐 bar 状态机、防前视、含交易成本、三段验证（train/validation/final），收益/MaxDD/Sharpe 统一组合口径，配有合成数据回归测试
+- **内置回测引擎**：逐 bar 状态机、防前视、含交易成本、三段验证（train/validation/final **各自 flat 起跑，无跨段状态继承**）、统一时间戳分段边界、统一参数 warmup，组合收益/MaxDD/Sharpe 出自同一条初始 1.0 基准曲线，配有 9 项合成数据回归测试
 
 ## 快速开始
 
@@ -33,10 +33,12 @@ python intraday.py position add AAPL 100 310.5 --stop 300   # 手动锁定止损
 python intraday.py position set-stop AAPL 295               # 改锁定止损
 python intraday.py position list
 
-# 回测（60m / 2 年，含三段验证与成本敏感性）
+# 回测（60m / 2 年，默认联网刷新数据；--use-cache 复用本地缓存）
 python backtest.py --interval 60m --period 730d
+# 固定日期窗口（可复现，报告数字绑定数据集指纹）
+python backtest.py --interval 60m --start 2024-09-06 --end 2026-09-06
 
-# 回归测试（验证执行时序：入场当根止损、信号优先级、跳空成交）
+# 回归测试（执行时序 4 项 + 统计口径/段隔离/warmup/止损锁定 5 项）
 python tests/test_backtest_engine.py
 ```
 

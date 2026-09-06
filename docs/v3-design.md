@@ -1,6 +1,7 @@
 # triple-resonance v3 设计文档 — 底仓当日 T 系统
 
-> 状态：设计稿（未实现）。本文档是 v3 的施工蓝图与验证门槛。
+> 状态：分阶段的施工蓝图。**P0 已实现**（纯本地仓位模型 + 单元测试，见下方 §10），
+> P1（Alpaca 接入）待用户启动。本文档其余章节为后续阶段的门槛与约束。
 > v2.2 的结论（详见 [backtest-report-v2.md](backtest-report-v2.md)）是本设计的前提：
 > **"60m 三指标整仓择时"已被证伪为负贡献（final 超额 -8.44pp），
 > 且它本来就不是当日 T——平均持仓 22 个交易日的波段器被拿去验证"今天买今天卖"。**
@@ -225,7 +226,7 @@ backtest.py          # v2.2 回测（保留作历史基线）
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| P0 | t_bucket 仓位模型 + 当日 PnL/有效成本计算（纯本地，无数据依赖） | 单元测试 |
+| P0 | t_bucket 仓位模型 + 当日 PnL/有效成本计算（纯本地，无数据依赖） | ✅ 单元测试 `tests/test_t_bucket.py`（24/24 PASS，2026-09-07）：`portfolio/base_position.py`·`portfolio/t_bucket.py`·`portfolio/portfolio.py` + `risk/position_size.py` |
 | P1 | Alpaca 数据接入（历史 1m + paper trading） | 拉 6 个月 NVDA/SPY 1m 数据成功 |
 | P2 | MarketContext（OR/VWAP/RS）+ Setup A 信号（纯计算，不下单） | 历史信号复盘：每笔 T 的 context/setup/trigger 可解释 |
 | P3 | 1m 回测引擎（继承 v2.2 实验设计） | 合成数据回归测试 + 通过 §7 门槛 |

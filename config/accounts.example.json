@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "system": {
+    "benchmark": "SPY",
+    "macro_file": "../runtime/macro.json",
+    "max_quote_age_seconds": 5,
+    "max_spread_bps": 8,
+    "max_entry_slippage_bps": 10,
+    "min_rvol": 1.0,
+    "rotation_threshold_bps": 10,
+    "require_style_alignment": true,
+    "allow_elevated_macro": false,
+    "allow_leveraged": false
+  },
+  "accounts": {
+    "broker_fractional": {
+      "db": "../state/broker_fractional.db",
+      "quantity_step": "0.001",
+      "rules_confirmed": false,
+      "instruments": {
+        "DIA": {"style": "defensive", "leverage": 1},
+        "QQQ": {"style": "growth", "leverage": 1},
+        "SPY": {"style": "broad", "leverage": 1}
+      }
+    },
+    "broker_whole_share": {
+      "db": "../state/broker_whole_share.db",
+      "quantity_step": "1",
+      "rules_confirmed": false,
+      "instruments": {
+        "DIA": {"style": "defensive", "leverage": 1},
+        "QQQ": {"style": "growth", "leverage": 1},
+        "SPY": {"style": "broad", "leverage": 1}
+      }
+    }
+  }
+}

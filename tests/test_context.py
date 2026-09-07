@@ -4,7 +4,7 @@ from datetime import datetime, timezone, timedelta
 
 from triple_resonance.domain.models import Bar
 from triple_resonance.domain.session import BacktestSessionProvider, MarketSession
-from triple_resonance.strategy.context import build_context
+from triple_resonance.strategy.context import DataQualityError, build_context
 
 
 def _bar(dt, o, h, l, c, v=100.0, vw=None):
@@ -48,6 +48,12 @@ class TestContext(unittest.TestCase):
         spy = [_bar(b.ts, 400, 400, 400, 400, vw=400) for b in bars]
         ctx = build_context(bars, spy, session)
         self.assertTrue(ctx.or_broken_down)
+
+    def test_missing_0930_opening_bar_is_rejected(self):
+        session, bars = self._day()
+        spy = [_bar(b.ts, 400, 400, 400, 400, vw=400) for b in bars]
+        with self.assertRaises(DataQualityError):
+            build_context(bars[1:], spy, session)
 
 
 if __name__ == "__main__":

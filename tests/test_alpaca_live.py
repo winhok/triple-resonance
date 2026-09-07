@@ -10,7 +10,8 @@ from triple_resonance.domain.models import Bar, SetupSignal
 
 
 class FakeBar:
-    def __init__(self, ts, o, h, l, c, v=100.0, vw=101.0):
+    def __init__(self, ts, o, h, l, c, v=100.0, vw=101.0, symbol="NVDA"):
+        self.symbol = symbol
         self.timestamp = ts
         self.open = o
         self.high = h
@@ -32,10 +33,10 @@ class FakeStream:
 
     def run(self):
         async def drive():
-            await self.coro("NVDA", FakeBar(datetime(2026, 6, 1, 14, 0, tzinfo=timezone.utc),
-                                           101, 102, 100, 101.5))
-            await self.coro("NVDA", FakeBar(datetime(2026, 6, 1, 14, 1, tzinfo=timezone.utc),
-                                           101.5, 102.5, 101, 102))
+            await self.coro(FakeBar(datetime(2026, 6, 1, 14, 0, tzinfo=timezone.utc),
+                                    101, 102, 100, 101.5))
+            await self.coro(FakeBar(datetime(2026, 6, 1, 14, 1, tzinfo=timezone.utc),
+                                    101.5, 102.5, 101, 102))
         asyncio.run(drive())
 
 

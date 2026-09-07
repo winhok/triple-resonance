@@ -42,18 +42,26 @@ class ParquetStore:
         return os.path.join(self.root, "alpaca", feed, symbol)
 
     def write(self, symbol: str, feed: str, timeframe: str, bars: List[Bar]) -> Dict:
-        """按年分区写出 parquet。返回 {year: {path, rows}}。"""
+        """按年增量合并 parquet（同 timestamp 新数据覆盖旧数据）。"""
         by_year: Dict[int, List[Bar]] = {}
         for b in bars:
             by_year.setdefault(b.ts.year, []).append(b)
         written: Dict[int, Dict] = {}
         for year, yr_bars in sorted(by_year.items()):
-            yr_bars.sort(key=lambda x: x.ts)
-            table = self._to_table(yr_bars)
             d = self._symbol_dir(feed, symbol)
             os.makedirs(d, exist_ok=True)
             path = os.path.join(d, f"{year}.parquet")
-            pq.write_table(table, path)
+            merged = {}
+            if os.path.exists(path):
+                for old in self._read_path(path, symbol):
+                    merged[old.ts] = old
+            for bar in yr_bars:
+                merged[bar.ts] = bar
+            yr_bars = sorted(merged.values(), key=lambda x: x.ts)
+            table = self._to_table(yr_bars)
+            tmp_path = path + ".tmp"
+            pq.write_table(table, tmp_path)
+            os.replace(tmp_path, path)
             written[year] = {"path": path, "rows": len(yr_bars)}
         return {"symbol": symbol, "feed": feed, "years": written}
 
@@ -66,28 +74,34 @@ class ParquetStore:
         for fn in sorted(os.listdir(d)):
             if not fn.endswith(".parquet"):
                 continue
-            t = pq.read_table(os.path.join(d, fn))
-            for row in t.to_pylist():
-                vw = row["vwap"]
-                if vw is None or (isinstance(vw, float) and math.isnan(vw)):
-                    vw = None
-                else:
-                    vw = float(vw)
-                ts = row["ts"]
-                # 落盘时为 UTC naive，读回统一标注 UTC（Alpaca 数据语义）
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                out.append(Bar(
-                    symbol=symbol,
-                    ts=ts,
-                    open=float(row["open"]),
-                    high=float(row["high"]),
-                    low=float(row["low"]),
-                    close=float(row["close"]),
-                    volume=float(row["volume"]),
-                    vwap=vw,
-                ))
+            out.extend(self._read_path(os.path.join(d, fn), symbol))
         out.sort(key=lambda b: b.ts)
+        return out
+
+    @staticmethod
+    def _read_path(path: str, symbol: str) -> List[Bar]:
+        out: List[Bar] = []
+        t = pq.read_table(path)
+        for row in t.to_pylist():
+            vw = row["vwap"]
+            if vw is None or (isinstance(vw, float) and math.isnan(vw)):
+                vw = None
+            else:
+                vw = float(vw)
+            ts = row["ts"]
+            # 落盘时为 UTC naive，读回统一标注 UTC（Alpaca 数据语义）
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            out.append(Bar(
+                symbol=symbol,
+                ts=ts,
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+                volume=float(row["volume"]),
+                vwap=vw,
+            ))
         return out
 
     @staticmethod
@@ -112,24 +126,49 @@ class ParquetStore:
 
     def write_meta(self, feed: str, timeframe: str, symbols: List[str],
                    start, end, per_symbol: Dict) -> str:
+        # meta/hash 必须描述落盘后的完整 coverage，而非仅本次下载窗口。
+        coverage: Dict = {}
+        feed_dir = os.path.join(self.root, "alpaca", feed)
+        if os.path.isdir(feed_dir):
+            for sym in sorted(os.listdir(feed_dir)):
+                sym_dir = os.path.join(feed_dir, sym)
+                if not os.path.isdir(sym_dir):
+                    continue
+                years = {}
+                for fn in sorted(os.listdir(sym_dir)):
+                    if fn.endswith(".parquet"):
+                        year = int(fn[:-8])
+                        path = os.path.join(sym_dir, fn)
+                        years[year] = {"path": path, "rows": pq.read_metadata(path).num_rows}
+                if years:
+                    coverage[sym] = {"symbol": sym, "feed": feed, "years": years}
         total_rows = sum(
             info["years"][y]["rows"]
-            for info in per_symbol.values() for y in info["years"]
+            for info in coverage.values() for y in info["years"]
         )
+        coverage_edges = []
+        for info in coverage.values():
+            for y in info["years"]:
+                table = pq.read_table(info["years"][y]["path"], columns=["ts"])
+                values = table.column("ts").to_pylist()
+                if values:
+                    coverage_edges.extend((values[0], values[-1]))
         meta = {
             "provider": "alpaca",
             "feed": feed,
             "timeframe": timeframe,
-            "symbols": symbols,
-            "start": str(start),
-            "end": str(end),
+            "symbols": sorted(coverage),
+            "start": str(min(coverage_edges)) if coverage_edges else str(start),
+            "end": str(max(coverage_edges)) if coverage_edges else str(end),
+            "request_start": str(start),
+            "request_end": str(end),
             "downloaded_at": datetime.now(timezone.utc).isoformat(),
             "total_rows": total_rows,
-            "dataset_hash": self._hash_coverage(per_symbol),
+            "dataset_hash": self._hash_coverage(coverage),
             "files": {
                 sym: {str(y): info["years"][y]["path"]
                       for y in info["years"]}
-                for sym, info in per_symbol.items()
+                for sym, info in coverage.items()
             },
         }
         d = os.path.join(self.root, "alpaca", feed)

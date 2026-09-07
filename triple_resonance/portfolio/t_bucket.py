@@ -105,11 +105,12 @@ class TBucketEngine:
     def flatten(self, price: float, ts: str, fee: float = 0.0) -> float:
         """15:45 强制平仓（不可关闭）。卖出全部 t_shares；记一次 round trip；置 t_flattened。
 
-        已空仓时 no-op（返回 0.0，不算 flatten 事件）。
+        已空仓时仍记录 flatten 门禁（返回 0.0，不算 round trip）。
         何时调用由引擎根据 session.force_flatten_at 决定（见 tests/test_session.py）。
         """
         s = self._s
         if s.t_shares == 0:
+            s.t_flattened = True
             return 0.0
         realized = (price - s.t_avg_cost) * s.t_shares - float(fee)
         s.daily_t_pnl += realized
@@ -125,12 +126,10 @@ class TBucketEngine:
     # ---------------------------------------------------------------- 跨日重置
 
     def reset_day(self) -> None:
-        """新交易日重置（无跨日状态）。清掉当日 T 计数与持仓；cumulative_t_pnl 不清零。"""
+        """新交易日重置。调用前必须已平仓，禁止静默吞掉隔夜 T 仓。"""
         s = self._s
-        s.t_shares = 0
-        s.t_avg_cost = None
-        s.t_stop_px = None
-        s.t_entry_ts = None
+        if s.t_shares != 0:
+            raise TBucketError("仍有 T 仓，必须先 flatten 后才能 reset_day")
         s.daily_t_pnl = 0.0
         s.round_trips_today = 0
         s.t_flattened = False

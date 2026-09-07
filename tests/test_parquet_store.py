@@ -40,6 +40,18 @@ def test_missing_symbol_returns_empty():
     assert store.read_bars("NOPE", "iex") == []
 
 
+def test_incremental_write_merges_and_deduplicates():
+    d = tempfile.mkdtemp()
+    store = ParquetStore(root=d)
+    store.write("NVDA", "iex", "1m", _bars()[:2])
+    replacement = Bar("NVDA", _bars()[1].ts, 100, 103, 99, 102, 1300, 101.0)
+    info = store.write("NVDA", "iex", "1m", [replacement, _bars()[2]])
+    back = store.read_bars("NVDA", "iex")
+    assert len(back) == 3
+    assert back[1].close == 102
+    assert info["years"][2025]["rows"] == 2
+
+
 def test_meta_written_with_feed_and_hash():
     d = tempfile.mkdtemp()
     store = ParquetStore(root=d)

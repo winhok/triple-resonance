@@ -2,7 +2,7 @@
 import unittest
 from datetime import datetime, timezone, timedelta
 
-from triple_resonance.bars.aggregator import aggregate
+from triple_resonance.bars.aggregator import aggregate, aggregate_closed
 from triple_resonance.domain.models import Bar
 
 
@@ -45,6 +45,15 @@ class TestAggregator(unittest.TestCase):
         self.assertEqual(len(out), 2)
         self.assertEqual(out[0].ts, day)
         self.assertEqual(out[1].ts, day + timedelta(minutes=5))
+
+    def test_closed_bucket_not_visible_before_close_and_rejects_gap(self):
+        day = datetime(2026, 6, 1, 13, 30, tzinfo=timezone.utc)
+        bars = [_bar("X", day + timedelta(minutes=i), 10, 11, 9, 10) for i in range(5)]
+        self.assertEqual(aggregate_closed(bars[:2], 5, day + timedelta(minutes=2), day), [])
+        closed = aggregate_closed(bars, 5, day + timedelta(minutes=5), day)
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(aggregate_closed(bars[:2] + bars[3:], 5,
+                                          day + timedelta(minutes=5), day), [])
 
     def test_multi_day_separate_anchors(self):
         d1 = datetime(2026, 6, 1, 13, 30, tzinfo=timezone.utc)

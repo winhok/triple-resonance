@@ -85,6 +85,18 @@ def test_invariant_flatten_zero():
         raise AssertionError("flatten 后再开 T 应拒")
 
 
+def test_flatten_while_empty_still_closes_day():
+    eng = _engine()
+    assert eng.flatten(151.0, "15:45") == 0.0
+    assert eng.state.t_flattened is True
+    try:
+        eng.t_buy(1, 150.0, 149.0, "15:46")
+    except TBucketError:
+        pass
+    else:
+        raise AssertionError("空仓 flatten 后也必须禁止当日再开仓")
+
+
 # ----------------------------------------------------- 不变式5: T PnL 不改 base_cost
 
 def test_invariant_base_cost_untouched():
@@ -121,6 +133,17 @@ def test_invariant_reset_day():
     assert eng.state.is_flat
     # cumulative_t_pnl 跨日保留（用于 effective_cost）
     assert eng.state.cumulative_t_pnl == 40.0
+
+
+def test_reset_day_rejects_open_position():
+    eng = _engine()
+    eng.t_buy(1, 150.0, 149.0, "09:50")
+    try:
+        eng.reset_day()
+    except TBucketError:
+        pass
+    else:
+        raise AssertionError("reset_day 不得静默丢弃未平仓位")
 
 
 # ----------------------------------------------------- effective_cost 数学

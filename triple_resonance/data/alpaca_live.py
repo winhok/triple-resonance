@@ -90,8 +90,27 @@ class AlpacaLiveProvider:
             client = StockDataStream(self._api_key, self._secret_key,
                                       feed=DataFeed(self._feed))
 
-        async def _handler(symbol: str, bar) -> None:
-            on_bar(_bar_to_domain(symbol, bar))
+        async def _handler(bar) -> None:
+            on_bar(_bar_to_domain(bar.symbol, bar))
 
         client.subscribe_bars(_handler, *symbols)
         client.run()
+
+    def historical_bars(self, symbols: Sequence[str], start: datetime,
+                        end: datetime, client=None) -> List[Bar]:
+        """live 启动时回补当日 09:30 至当前的 1m 历史。"""
+        if client is None:
+            if not _HAVE_ALPACA:
+                raise RuntimeError("alpaca-py 未安装，无法回补历史数据")
+            from alpaca.data.historical.stock import StockHistoricalDataClient
+            client = StockHistoricalDataClient(api_key=self._api_key,
+                                               secret_key=self._secret_key)
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+        req = StockBarsRequest(symbol_or_symbols=list(symbols), timeframe=TimeFrame.Minute,
+                               start=start, end=end, feed=DataFeed(self._feed))
+        result = client.get_stock_bars(req)
+        out: List[Bar] = []
+        for symbol in symbols:
+            out.extend(_bar_to_domain(symbol, b) for b in result.data.get(symbol, []))
+        return sorted(out, key=lambda b: (b.ts, b.symbol))

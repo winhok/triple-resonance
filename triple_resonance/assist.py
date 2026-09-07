@@ -12,11 +12,11 @@ import sys
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 
-from .bars.aggregator import aggregate
+from .bars.aggregator import aggregate_closed
 from .data.alpaca_live import AlpacaLiveProvider
 from .domain.models import Bar, MarketContext, SetupSignal
 from .domain.session import BacktestSessionProvider, MarketSession
-from .strategy.context import build_context
+from .strategy.context import DataQualityError, build_context, validate_session_data
 from .strategy.trend_pullback import detect_trend_pullback
 
 
@@ -29,9 +29,15 @@ def assist_decision(stock_bars: List[Bar], spy_bars: List[Bar],
     """
     if len(stock_bars) < 15 or len(spy_bars) < 15:
         return None, None
-    ctx = build_context(stock_bars, spy_bars, session)
-    bars_5m = aggregate(stock_bars, 5)
-    opening_range_end = stock_bars[0].ts + timedelta(minutes=15)
+    try:
+        open_ts = validate_session_data(stock_bars, spy_bars, session)
+        ctx = build_context(stock_bars, spy_bars, session)
+    except DataQualityError:
+        return None, None
+    # Alpaca bar 事件代表这一分钟已经闭合，所以下一分钟边界才是 as_of。
+    as_of = stock_bars[-1].ts + timedelta(minutes=1)
+    bars_5m = aggregate_closed(stock_bars, 5, as_of, open_ts)
+    opening_range_end = open_ts + timedelta(minutes=15)
     sig = detect_trend_pullback(ctx, bars_5m, opening_range_end, rs_threshold)
     return sig, ctx
 
@@ -45,15 +51,38 @@ def _run_live(symbols: List[str], feed: str, rs_threshold: float) -> None:
     sess_provider = BacktestSessionProvider()
     rolling: dict[str, List[Bar]] = {s: [] for s in symbols}
     cur_day = None
+    bootstrapped_day = None
+    bootstrap_failed_day = None
+    emitted: set[tuple] = set()
 
     def on_bar(b: Bar) -> None:
-        nonlocal cur_day
+        nonlocal cur_day, bootstrapped_day, bootstrap_failed_day
         d = b.ts.date()
         if cur_day != d:
             for s in rolling:
                 rolling[s] = []
             cur_day = d
+            bootstrapped_day = None
+            bootstrap_failed_day = None
+            emitted.clear()
+        if bootstrapped_day != d and bootstrap_failed_day != d:
+            session = sess_provider.session_for(d)
+            from zoneinfo import ZoneInfo
+            start = session.open_at.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(b.ts.tzinfo)
+            try:
+                history = provider.historical_bars(symbols, start, b.ts)
+                for hb in history:
+                    rolling[hb.symbol].append(hb)
+                bootstrapped_day = d
+            except Exception as exc:
+                bootstrap_failed_day = d
+                print(f"[DATA_INVALID] {d} historical bootstrap 失败：{exc}", file=sys.stderr)
+                return
+        if bootstrap_failed_day == d:
+            return
         rolling[b.symbol].append(b)
+        # 历史与 WebSocket 边界可能重叠，按 timestamp 去重并排序。
+        rolling[b.symbol] = sorted({x.ts: x for x in rolling[b.symbol]}.values(), key=lambda x: x.ts)
         if b.symbol != stock_sym:
             return
         sb = rolling[stock_sym]
@@ -63,6 +92,10 @@ def _run_live(symbols: List[str], feed: str, rs_threshold: float) -> None:
         session = sess_provider.session_for(d)
         sig, ctx = assist_decision(sb, pb, session, rs_threshold)
         if sig:
+            key = (sig.symbol, sig.setup, sig.ts)
+            if key in emitted:
+                return
+            emitted.add(key)
             print(f"[SETUP] {sig.ts} {sig.symbol} {sig.side} "
                   f"entry~{sig.entry_ref:.2f} stop={sig.structural_stop:.2f} "
                   f"RS={ctx.relative_strength:+.2%} | {','.join(sig.reason)}")

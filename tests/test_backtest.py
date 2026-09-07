@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime, timezone, timedelta
 
 from triple_resonance.domain.models import Bar
-from triple_resonance.backtest.intraday import run_backtest
+from triple_resonance.backtest.intraday import run_backtest, run_chronological_backtest
 
 
 def _mk(symbol, day, prices):
@@ -87,6 +87,21 @@ class TestBacktest(unittest.TestCase):
         # 当日有 T 日数应等于产生 round trip 的天数
         self.assertLessEqual(res.n_t_days, res.n_days)
 
+    def test_closed_5m_executes_at_next_1m_open_and_charges_both_fees(self):
+        day = datetime(2026, 6, 1).date()
+        store = self._store([_uptrend_day(day)], [_spy_up(day)])
+        free = run_backtest("NVDA", "SPY", store, base_shares=80,
+                            base_cost=100.0, fee_per_trade=0.0)
+        paid = run_backtest("NVDA", "SPY", store, base_shares=80,
+                            base_cost=100.0, fee_per_trade=2.0)
+        self.assertEqual(paid.n_trades, 1)
+        trade = paid.trades[0]
+        expected_open = datetime(2026, 6, 1, 13, 30, tzinfo=timezone.utc)
+        self.assertEqual(trade.entry_ts, expected_open + timedelta(minutes=35))
+        self.assertAlmostEqual(trade.entry_px, 104.03)  # 下一根 1m open，不是 5m close 104.00
+        self.assertAlmostEqual(paid.t_pnl_total, free.t_pnl_total - 4.0)
+        self.assertAlmostEqual(trade.realized, paid.t_pnl_total)
+
     def test_no_signal_day_no_trade(self):
         store = self._store([_flat_day(datetime(2026, 6, 1).date())],
                             [_spy_up(datetime(2026, 6, 1).date())])
@@ -95,6 +110,24 @@ class TestBacktest(unittest.TestCase):
         self.assertEqual(res.n_trades, 0)
         self.assertAlmostEqual(res.t_pnl_total, 0.0)
         self.assertEqual(res.pct_days_no_trade, 1.0)
+
+    def test_missing_opening_range_marks_day_invalid(self):
+        day = datetime(2026, 6, 1).date()
+        stock = _uptrend_day(day)[1:]  # 缺 09:30
+        store = self._store([stock], [_spy_up(day)])
+        res = run_backtest("NVDA", "SPY", store, base_shares=80, base_cost=100.0)
+        self.assertEqual(res.n_days, 0)
+        self.assertEqual(res.invalid_days, 1)
+        self.assertEqual(res.n_trades, 0)
+
+    def test_chronological_segments_are_independent(self):
+        days = [datetime(2026, 6, i).date() for i in range(1, 5)]
+        store = self._store([_flat_day(d) for d in days], [_spy_up(d) for d in days])
+        result = run_chronological_backtest("NVDA", "SPY", store, base_shares=80,
+                                            base_cost=100.0)
+        self.assertEqual(set(result), {"train", "validation", "final"})
+        self.assertEqual([result[s].n_days for s in ("train", "validation", "final")],
+                         [2, 1, 1])
 
     def test_flatten_path_no_crash(self):
         """入场后价格横盘至 15:45 → 强制 flatten，round trip 计 1，不崩。"""

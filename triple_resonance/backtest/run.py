@@ -9,7 +9,7 @@ import sys
 from typing import Optional
 
 from ..data.parquet_store import ParquetStore
-from .intraday import run_backtest
+from .intraday import run_backtest, run_chronological_backtest
 
 
 def main(argv: Optional[list] = None) -> None:
@@ -27,21 +27,31 @@ def main(argv: Optional[list] = None) -> None:
     p.add_argument("--rs-threshold", type=float, default=0.0)
     p.add_argument("--fee", type=float, default=1.0, help="单边手续费")
     p.add_argument("--slippage", type=float, default=0.0, help="滑点（占入场价比例）")
+    p.add_argument("--full-discovery", action="store_true",
+                   help="仅输出全样本 discovery；默认输出冻结规则的 train/validation/final")
     args = p.parse_args(argv)
 
     store = ParquetStore(root=args.root)
     try:
-        res = run_backtest(
-            args.symbol, args.spy, store,
+        common = dict(
             base_shares=args.base_shares, base_cost=args.base_cost,
             t_pct=args.t_pct, risk_pct=args.risk_pct, tp_r=args.tp_r,
             rs_threshold=args.rs_threshold, fee_per_trade=args.fee,
             slippage=args.slippage, feed=args.feed,
         )
+        if args.full_discovery:
+            res = run_backtest(args.symbol, args.spy, store, **common)
+        else:
+            segments = run_chronological_backtest(args.symbol, args.spy, store, **common)
     except ValueError as e:
         print(str(e), file=sys.stderr)
         sys.exit(2)
-    print(res.summarize())
+    if args.full_discovery:
+        print("[DISCOVERY ONLY]\n" + res.summarize())
+    else:
+        for name in ("train", "validation", "final"):
+            print(f"\n=== {name.upper()} (flat start, frozen Setup A) ===")
+            print(segments[name].summarize())
 
 
 if __name__ == "__main__":

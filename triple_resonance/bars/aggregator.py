@@ -88,3 +88,23 @@ def aggregate(bars: Sequence[Bar], bucket_minutes: int,
             ))
     out.sort(key=lambda b: b.ts)
     return out
+
+
+def aggregate_closed(bars: Sequence[Bar], bucket_minutes: int, as_of: datetime,
+                     session_open: datetime) -> List[Bar]:
+    """仅返回在 ``as_of`` 前完整闭合且没有分钟缺口的桶。
+
+    Bar.ts 是桶开始时间；例如 09:45 的 5m 桶到 09:50 才可见。
+    ``as_of`` 通常是下一根 1m 的开始时间，因而不会读取该分钟的 OHLC。
+    """
+    eligible = [b for b in bars if session_open <= b.ts < as_of]
+    grouped = aggregate(eligible, bucket_minutes,
+                        session_opens={session_open.date(): session_open})
+    source_ts = {b.ts.replace(second=0, microsecond=0) for b in eligible}
+    out: List[Bar] = []
+    for b in grouped:
+        close_at = b.ts + timedelta(minutes=bucket_minutes)
+        expected = {b.ts + timedelta(minutes=i) for i in range(bucket_minutes)}
+        if close_at <= as_of and expected <= source_ts:
+            out.append(b)
+    return out

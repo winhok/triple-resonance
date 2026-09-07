@@ -8,11 +8,50 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, Sequence
 
 from ..domain.models import Bar, MarketContext
 from ..domain.session import MarketSession, OPENING_RANGE_MIN
+
+
+class DataQualityError(ValueError):
+    """当日数据不足以按固定 session 口径构造上下文。"""
+
+
+def _session_open_like(session: MarketSession, sample: datetime) -> datetime:
+    """把 session 的 ET 墙钟开盘转换到 Bar 使用的时区。"""
+    if sample.tzinfo is None:
+        return session.open_at
+    if session.open_at.tzinfo is not None:
+        return session.open_at.astimezone(sample.tzinfo)
+    from zoneinfo import ZoneInfo
+    return session.open_at.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(sample.tzinfo)
+
+
+def validate_session_data(stock_bars: Sequence[Bar], spy_bars: Sequence[Bar],
+                          session: MarketSession) -> datetime:
+    """严格校验 opening range：双方 09:30–09:44 必须恰好 15 根。"""
+    if not stock_bars or not spy_bars:
+        raise DataQualityError("缺少个股或 SPY 数据")
+    for name, bars in (("stock", stock_bars), ("SPY", spy_bars)):
+        timestamps = [b.ts for b in bars]
+        if timestamps != sorted(timestamps):
+            raise DataQualityError(f"{name} bar 乱序")
+        if len(timestamps) != len(set(timestamps)):
+            raise DataQualityError(f"{name} bar 时间戳重复")
+    open_ts = _session_open_like(session, stock_bars[0].ts)
+    expected = {open_ts + timedelta(minutes=i) for i in range(OPENING_RANGE_MIN)}
+    for name, bars in (("stock", stock_bars), ("SPY", spy_bars)):
+        actual = {b.ts for b in bars if open_ts <= b.ts < open_ts + timedelta(minutes=OPENING_RANGE_MIN)}
+        if actual != expected:
+            raise DataQualityError(f"{name} opening range 不完整（需要 09:30–09:44 共 15/15）")
+    return open_ts
+
+
+def session_bounds_like(session: MarketSession, sample: datetime) -> tuple[datetime, datetime]:
+    open_ts = _session_open_like(session, sample)
+    return open_ts, open_ts + (session.close_at - session.open_at)
 
 
 def _vwap(bars: Sequence[Bar]) -> float:
@@ -31,33 +70,34 @@ def build_context(stock_bars: Sequence[Bar], spy_bars: Sequence[Bar],
                   session: MarketSession, as_of: Optional[datetime] = None) -> MarketContext:
     """由当日 1m Bar 构建 MarketContext（截至 as_of，默认最后一根）。
 
-    stock_bars 必须从 session 开盘首根开始（opening range = 前 15 根 1m）。
+    opening range 固定为 session 09:30–09:44；不完整时拒绝构造。
     """
-    if not stock_bars:
-        raise ValueError("stock_bars 不能为空")
+    open_ts = validate_session_data(stock_bars, spy_bars, session)
     if as_of is None:
         as_of = stock_bars[-1].ts
 
-    sb = [b for b in stock_bars if b.ts <= as_of]
+    _, close_ts = session_bounds_like(session, stock_bars[0].ts)
+    sb = [b for b in stock_bars if open_ts <= b.ts <= as_of and b.ts < close_ts]
     if not sb:
         raise ValueError("as_of 早于所有 stock bar")
-    spyb = [b for b in spy_bars if b.ts <= as_of]
+    spyb = [b for b in spy_bars if open_ts <= b.ts <= as_of and b.ts < close_ts]
     if not spyb:
         raise ValueError("as_of 早于所有 spy bar")
 
-    open_px = sb[0].open
+    stock_open_bar = next(b for b in sb if b.ts == open_ts)
+    open_px = stock_open_bar.open
     close_now = sb[-1].close
     stock_ret = close_now / open_px - 1.0
 
-    spy_open = spyb[0].open
+    spy_open = next(b for b in spyb if b.ts == open_ts).open
     spy_close = spyb[-1].close
     spy_ret = spy_close / spy_open - 1.0
 
     session_vwap = _vwap(sb)
     spy_session_vwap = _vwap(spyb)
 
-    # Opening Range = 前 OPENING_RANGE_MIN 根 1m（=09:30–09:45）
-    or_bars = sb[:OPENING_RANGE_MIN] if len(sb) >= OPENING_RANGE_MIN else sb
+    # Opening Range = session 自然分钟 09:30–09:44，不以“当天前 15 根”代替。
+    or_bars = [b for b in sb if open_ts <= b.ts < open_ts + timedelta(minutes=OPENING_RANGE_MIN)]
     or_high = max(b.high for b in or_bars)
     or_low = min(b.low for b in or_bars)
 

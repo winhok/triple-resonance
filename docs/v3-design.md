@@ -1,7 +1,8 @@
 # triple-resonance v3 设计文档 — 底仓当日 T 系统
 
-> 状态：分阶段的施工蓝图。**P0 已实现**（领域模型 + 状态机 + Session + 定仓 + 本地 SQLite 状态库，
-> 纯本地、无数据依赖、36 项单测全 PASS，见 §10）。
+> 状态：分阶段的施工蓝图。**P0 ✅ 已实现**（领域模型 + 状态机 + Session + 定仓 + 本地 SQLite 状态库，
+> 纯本地、无数据依赖、36 项单测全 PASS）；**P1 ✅ 已实现**（Alpaca 历史 1m + Parquet Store，
+> 已拉取 NVDA+SPY 2025-01-02~2026-08-31 的 1m 数据并落地，feed=IEX 元信息完整，见 §10）。
 > v2.2 的结论（详见 [backtest-report-v2.md](backtest-report-v2.md)）是本设计的前提：
 > **"60m 三指标整仓择时"已被证伪为负贡献（final 超额 -8.44pp），
 > 且它本来就不是当日 T——平均持仓 22 个交易日的波段器被拿去验证"今天买今天卖"。**
@@ -14,7 +15,7 @@ SDK 对象不允许渗透进策略/状态机层（见 §9 包结构）。P0 完�
 
 ```text
 P0  Domain + Session + T Bucket + Interfaces + StateStore   ✅ 已实现
-P1  Alpaca Historical 1m + Data Store（parquet，含 feed 元信息）
+P1  Alpaca Historical 1m + Data Store（parquet，含 feed 元信息）  ✅ 已实现
 P2  1m → 5m/15m 聚合（按 session 锚定）+ MarketContext + Setup A（纯函数）
 P3  Same-day Backtester（1m 事件引擎，A/B/C 三基准，Signal Contribution = C−B）
 P4  Alpaca Live WebSocket + Paper Execution（TradingClient，非 Broker API）
@@ -274,7 +275,7 @@ intraday.py   backtest.py   indicators.py   # 旧三共振仅 observe；新回�
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | P0 | Domain + Session + T Bucket + Interfaces + SQLite StateStore（纯本地，无数据依赖） | ✅ 36 项单测 PASS：`tests/test_t_bucket.py`(19)·`test_session.py`(4)·`test_position_sizing.py`(6)·`test_state_store.py`(7)。覆盖 7 条不变式 + effective_cost + 定仓 + reconcile |
-| P1 | Alpaca Historical 1m + Parquet Store（含 feed=IEX/SIP 元信息） | `python -m triple_resonance.data.download --symbols NVDA SPY --timeframe 1m` 落地 parquet，元信息可校验 |
+| P1 | Alpaca Historical 1m + Parquet Store（含 feed=IEX/SIP 元信息） | ✅ 已实现 + 实跑验证。`tests/test_parquet_store.py`(round-trip+meta)·`test_alpaca_historical.py`(Bar 转换+oauth profile，无网络) 共 11 项 PASS；`python -m triple_resonance.data.download --symbols NVDA SPY --start 2025-01-01 --end 2026-09-01 --timeframe 1m --feed iex` 落地 `data/alpaca/iex/{NVDA,SPY}/{2025,2026}.parquet` + `meta.json`（NVDA 167,493 / SPY 164,766 根，415 交易日，跨 2025-01-02~2026-08-31）。**注意**：Alpaca `end` 为右开区间，欲含某日需 end≥次日；IEX free 层历史回溯至 2025-01 可用；个别日（如 2025-01-02 SPY）首根落在 10:30 ET 属 IEX 开盘缺口，P2/P3 按 ts 对齐即可 |
 | P2 | 1m→5m/15m 聚合（session 锚定）+ MarketContext + Setup A（纯函数） | 合成/历史信号复盘：每笔 T 的 context/setup/trigger 可解释 |
 | P3 | 1m same-day Backtester（A/B/C 三基准，Signal Contribution=C−B） | 合成数据回归测试 + 通过 §7 门槛 |
 | P4 | Alpaca Live WebSocket + Paper Execution（TradingClient） | 一周模拟盘：T 仓每日清零、无隔夜、reconcile OK |

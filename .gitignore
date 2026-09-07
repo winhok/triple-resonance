@@ -5,3 +5,10 @@ venv/
 *.pkl
 /tmp/
 .DS_Store
+# 本地大数据存储（Alpaca 1m parquet，按 feed/symbol/year 分区）——不入库
+# 注意前导斜杠：仅忽略仓库根的 data/，不能误伤 triple_resonance/data/ 包目录
+/data/
+# 运行时状态库（SQLite reconcile）
+/state.db
+# 测试缓存
+.pytest_cache/

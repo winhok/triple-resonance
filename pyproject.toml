@@ -4,20 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "triple-resonance"
-version = "0.3.0"
-description = "美股底仓当日 T 系统（v3）：领域模型 + T bucket 状态机 + Alpaca 历史 1m 接入 + 同口径回测"
+version = "0.3.1"
+description = "Manual-only US-equity day-T observation, ledger and research toolkit"
 requires-python = ">=3.11"
 dependencies = [
-    "pandas>=2.0",
-    "numpy>=1.26",
-    "yfinance>=0.2",
-    "alpaca-py>=0.44",
-    "pyarrow>=15.0",
-    "pyyaml>=6.0",
+    "pandas>=2.0,<4", "numpy>=1.26,<3", "yfinance>=0.2",
+    "alpaca-py>=0.44,<1", "pyarrow>=15.0", "pyyaml>=6.0",
+    "exchange-calendars>=4.13,<5",
 ]
-
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
-
+[project.scripts]
+t-assist = "triple_resonance.assistant.cli:main"
 [tool.setuptools.packages.find]
 include = ["triple_resonance*"]

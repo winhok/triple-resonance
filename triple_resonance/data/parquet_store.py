@@ -1,188 +1,161 @@
-"""Parquet 落盘（P1）。
+"""Incremental 1m store with writer locking, atomic files and content hashes.
 
-结构：
-    <root>/alpaca/<feed>/<symbol>/<year>.parquet
-    <root>/alpaca/<feed>/meta.json
-
-meta.json 含 provider / feed / timeframe / symbols / start / end / downloaded_at /
-dataset_hash，保证回测/实盘同口径、可复现。
-
-dataset_hash 是 coverage 指纹（symbol × year × 行数），任一年份/标的数据变化都会变。
+Archive both files and manifest to reproduce a run after later upserts.
 """
 from __future__ import annotations
-
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-import math
+from pathlib import Path
+import sqlite3
+import tempfile
 import os
-from datetime import datetime, timezone
-from typing import Dict, List
-
-import pyarrow as pa
-import pyarrow.parquet as pq
-
+from ..assistant.calendar import utc
+from ..assistant.ledger import symbol as normalize_symbol
+from ..assistant.signals import valid_bar
 from ..domain.models import Bar
-
-_SCHEMA = pa.schema([
-    ("ts", pa.timestamp("us")),
-    ("open", pa.float64()),
-    ("high", pa.float64()),
-    ("low", pa.float64()),
-    ("close", pa.float64()),
-    ("volume", pa.float64()),
-    ("vwap", pa.float64()),
-])
 
 
 class ParquetStore:
-    def __init__(self, root: str = "data"):
-        self.root = root
+    def __init__(self, root='data'):
+        self.root = str(root)
 
-    def _symbol_dir(self, feed: str, symbol: str) -> str:
-        return os.path.join(self.root, "alpaca", feed, symbol)
+    def _feed_dir(self, feed):
+        if feed not in ('iex', 'sip', 'otc'):
+            raise ValueError('Invalid feed')
+        return Path(self.root) / 'alpaca' / feed
 
-    def write(self, symbol: str, feed: str, timeframe: str, bars: List[Bar]) -> Dict:
-        """按年增量合并 parquet（同 timestamp 新数据覆盖旧数据）。"""
-        by_year: Dict[int, List[Bar]] = {}
+    def _symbol_dir(self, feed, symbol):
+        return str(self._feed_dir(feed) / normalize_symbol(symbol))
+
+    @contextmanager
+    def _lock(self, feed):
+        root = self._feed_dir(feed)
+        root.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(root / '.writer.sqlite', timeout=30, isolation_level=None)
+        try:
+            db.execute('CREATE TABLE IF NOT EXISTS lock_marker (id INTEGER)')
+            db.execute('BEGIN IMMEDIATE')
+            yield
+            db.execute('COMMIT')
+        except BaseException:
+            if db.in_transaction:
+                db.execute('ROLLBACK')
+            raise
+        finally:
+            db.close()
+
+    def write(self, symbol, feed, timeframe, bars):
+        import pyarrow.parquet as pq
+        sym = normalize_symbol(symbol)
+        if timeframe != '1m':
+            raise ValueError('This store only accepts 1m source bars')
+        if not bars:
+            raise ValueError(f'{sym}: empty download is not a successful dataset update')
+        if any(b.symbol.upper() != sym or not valid_bar(b) for b in bars):
+            raise ValueError('Invalid/mixed-symbol OHLCV or non-aware timestamp')
+        groups = {}
         for b in bars:
-            by_year.setdefault(b.ts.year, []).append(b)
-        written: Dict[int, Dict] = {}
-        for year, yr_bars in sorted(by_year.items()):
-            d = self._symbol_dir(feed, symbol)
-            os.makedirs(d, exist_ok=True)
-            path = os.path.join(d, f"{year}.parquet")
-            merged = {}
-            if os.path.exists(path):
-                for old in self._read_path(path, symbol):
-                    merged[old.ts] = old
-            for bar in yr_bars:
-                merged[bar.ts] = bar
-            yr_bars = sorted(merged.values(), key=lambda x: x.ts)
-            table = self._to_table(yr_bars)
-            tmp_path = path + ".tmp"
-            pq.write_table(table, tmp_path)
-            os.replace(tmp_path, path)
-            written[year] = {"path": path, "rows": len(yr_bars)}
-        return {"symbol": symbol, "feed": feed, "years": written}
+            groups.setdefault(utc(b.ts).year, []).append(b)
+        written = {}
+        with self._lock(feed):
+            for year, new in sorted(groups.items()):
+                d = Path(self._symbol_dir(feed, sym))
+                d.mkdir(parents=True, exist_ok=True)
+                path = d / f'{year}.parquet'
+                merged = {utc(b.ts): b for b in self._read_path(path, sym)} if path.exists() else {}
+                merged.update({utc(b.ts): b for b in new})
+                values = sorted(merged.values(), key=lambda b: utc(b.ts))
+                fd, tmp = tempfile.mkstemp(dir=d, prefix=f'.{year}-', suffix='.tmp')
+                os.close(fd)
+                try:
+                    pq.write_table(self._to_table(values), tmp)
+                    with open(tmp, 'rb') as f:
+                        os.fsync(f.fileno())
+                    os.replace(tmp, path)
+                finally:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                written[year] = {'path': str(path), 'rows': len(values)}
+        return {'symbol': sym, 'feed': feed, 'years': written}
 
-    def read_bars(self, symbol: str, feed: str) -> List[Bar]:
-        """读回某 symbol 全部年份的 1m Bar（按 ts 升序）。文件不存在返回 []。"""
-        d = self._symbol_dir(feed, symbol)
-        if not os.path.isdir(d):
-            return []
-        out: List[Bar] = []
-        for fn in sorted(os.listdir(d)):
-            if not fn.endswith(".parquet"):
-                continue
-            out.extend(self._read_path(os.path.join(d, fn), symbol))
-        out.sort(key=lambda b: b.ts)
-        return out
+    def read_bars(self, symbol, feed):
+        d = Path(self._symbol_dir(feed, symbol))
+        out = [b for p in sorted(d.glob('*.parquet')) for b in self._read_path(p, normalize_symbol(symbol))]
+        return sorted(out, key=lambda b: b.ts)
 
     @staticmethod
-    def _read_path(path: str, symbol: str) -> List[Bar]:
-        out: List[Bar] = []
-        t = pq.read_table(path)
-        for row in t.to_pylist():
-            vw = row["vwap"]
-            if vw is None or (isinstance(vw, float) and math.isnan(vw)):
-                vw = None
-            else:
-                vw = float(vw)
-            ts = row["ts"]
-            # 落盘时为 UTC naive，读回统一标注 UTC（Alpaca 数据语义）
+    def _read_path(path, symbol):
+        import pyarrow.parquet as pq
+        import math
+        out = []
+        for r in pq.read_table(path).to_pylist():
+            ts = r['ts']
             if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            out.append(Bar(
-                symbol=symbol,
-                ts=ts,
-                open=float(row["open"]),
-                high=float(row["high"]),
-                low=float(row["low"]),
-                close=float(row["close"]),
-                volume=float(row["volume"]),
-                vwap=vw,
-            ))
+                ts = ts.replace(tzinfo=timezone.utc)  # legacy UTC-naive storage
+            vw = r['vwap']
+            if vw is not None and math.isnan(vw):
+                vw = None
+            out.append(Bar(symbol, utc(ts), r['open'], r['high'], r['low'], r['close'], r['volume'], vw))
         return out
 
     @staticmethod
-    def _to_table(bars: List[Bar]) -> pa.Table:
-        # Alpaca 数据语义为 UTC；pyarrow timestamp("us") 不带时区，落盘前把 tz 信息剥掉
-        # （保留 UTC 语义），读回时再标注 tzinfo=utc，保证 round-trip 一致。
-        def _naive_utc(dt):
-            if dt.tzinfo is not None:
-                return dt.astimezone(timezone.utc).replace(tzinfo=None)
-            return dt
+    def _to_table(bars):
+        import pyarrow as pa
+        schema = pa.schema([('ts', pa.timestamp('us', tz='UTC'))] +
+                           [(k, pa.float64()) for k in ('open', 'high', 'low', 'close', 'volume', 'vwap')])
+        rows = [dict(ts=utc(b.ts), open=b.open, high=b.high, low=b.low, close=b.close,
+                     volume=b.volume, vwap=b.vwap) for b in bars]
+        return pa.Table.from_pylist(rows, schema=schema)
 
-        cols = {
-            "ts": [_naive_utc(b.ts) for b in bars],
-            "open": [b.open for b in bars],
-            "high": [b.high for b in bars],
-            "low": [b.low for b in bars],
-            "close": [b.close for b in bars],
-            "volume": [b.volume for b in bars],
-            "vwap": [b.vwap if b.vwap is not None else float("nan") for b in bars],
-        }
-        return pa.table(cols, schema=_SCHEMA)
-
-    def write_meta(self, feed: str, timeframe: str, symbols: List[str],
-                   start, end, per_symbol: Dict) -> str:
-        # meta/hash 必须描述落盘后的完整 coverage，而非仅本次下载窗口。
-        coverage: Dict = {}
-        feed_dir = os.path.join(self.root, "alpaca", feed)
-        if os.path.isdir(feed_dir):
-            for sym in sorted(os.listdir(feed_dir)):
-                sym_dir = os.path.join(feed_dir, sym)
-                if not os.path.isdir(sym_dir):
-                    continue
-                years = {}
-                for fn in sorted(os.listdir(sym_dir)):
-                    if fn.endswith(".parquet"):
-                        year = int(fn[:-8])
-                        path = os.path.join(sym_dir, fn)
-                        years[year] = {"path": path, "rows": pq.read_metadata(path).num_rows}
-                if years:
-                    coverage[sym] = {"symbol": sym, "feed": feed, "years": years}
-        total_rows = sum(
-            info["years"][y]["rows"]
-            for info in coverage.values() for y in info["years"]
-        )
-        coverage_edges = []
-        for info in coverage.values():
-            for y in info["years"]:
-                table = pq.read_table(info["years"][y]["path"], columns=["ts"])
-                values = table.column("ts").to_pylist()
-                if values:
-                    coverage_edges.extend((values[0], values[-1]))
-        meta = {
-            "provider": "alpaca",
-            "feed": feed,
-            "timeframe": timeframe,
-            "symbols": sorted(coverage),
-            "start": str(min(coverage_edges)) if coverage_edges else str(start),
-            "end": str(max(coverage_edges)) if coverage_edges else str(end),
-            "request_start": str(start),
-            "request_end": str(end),
-            "downloaded_at": datetime.now(timezone.utc).isoformat(),
-            "total_rows": total_rows,
-            "dataset_hash": self._hash_coverage(coverage),
-            "files": {
-                sym: {str(y): info["years"][y]["path"]
-                      for y in info["years"]}
-                for sym, info in coverage.items()
-            },
-        }
-        d = os.path.join(self.root, "alpaca", feed)
-        os.makedirs(d, exist_ok=True)
-        path = os.path.join(d, "meta.json")
-        with open(path, "w") as f:
-            json.dump(meta, f, indent=2)
-        return path
+    def write_meta(self, feed, timeframe, symbols, start, end, per_symbol):
+        import pyarrow.parquet as pq
+        if timeframe != '1m':
+            raise ValueError('Only 1m source storage is supported')
+        with self._lock(feed):
+            root = self._feed_dir(feed)
+            files, hashes, edges = {}, {}, []
+            rows = 0
+            for path in sorted(root.glob('*/*.parquet')):
+                sym, year = path.parent.name, path.stem
+                count = pq.read_metadata(path).num_rows
+                values = pq.read_table(path, columns=['ts']).column('ts').to_pylist()
+                for value in (values[0], values[-1]) if values else []:
+                    edges.append(utc(value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value))
+                files.setdefault(sym, {})[year] = str(path)
+                with path.open('rb') as f:
+                    hashes[f'{sym}/{path.name}'] = hashlib.file_digest(f, 'sha256').hexdigest()
+                rows += count
+            digest = hashlib.sha256(json.dumps({'feed': feed, 'timeframe': timeframe,
+                                               'files': hashes}, sort_keys=True).encode()).hexdigest()
+            meta = dict(provider='alpaca', feed=feed, timeframe=timeframe, symbols=sorted(files),
+                        start=min(edges).isoformat() if edges else str(start),
+                        end=(max(edges) + timedelta(minutes=1)).isoformat() if edges else str(end),
+                        end_semantics='exclusive', request_start=str(start), request_end=str(end),
+                        downloaded_at=datetime.now(timezone.utc).isoformat(), total_rows=rows,
+                        dataset_hash=digest, hash_kind='parquet-bytes-sha256', file_hashes=hashes, files=files)
+            fd, tmp = tempfile.mkstemp(dir=root, prefix='.manifest-', suffix='.tmp')
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(meta, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, root / 'meta.json')
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+        return str(root / 'meta.json')
 
     @staticmethod
-    def _hash_coverage(per_symbol: Dict) -> str:
+    def _hash_coverage(per_symbol):
+        """Compatibility name; now hashes bytes, not only row counts."""
         h = hashlib.sha256()
         for sym in sorted(per_symbol):
             h.update(sym.encode())
-            for y in sorted(per_symbol[sym]["years"]):
-                h.update(f"{y}:{per_symbol[sym]['years'][y]['rows']}".encode())
+            h.update(per_symbol[sym].get('feed', '').encode())
+            for year, info in sorted(per_symbol[sym]['years'].items()):
+                h.update(str(year).encode())
+                with open(info['path'], 'rb') as f:
+                    h.update(hashlib.file_digest(f, 'sha256').digest())
         return h.hexdigest()

@@ -1,98 +1,114 @@
-# triple-resonance
+# triple-resonance — 手动日 T 操作助手
 
-**美股底仓做 T 辅助工具** — 底仓观察 + 锁定止损（v2.x），演进目标：当日 T 系统（v3，见 [docs/v3-design.md](docs/v3-design.md)）。
+**仅行情、研究、计划、手动成交台账与提醒，不连接任何券商下单接口。**
+本次改造基于 `d6aeda7`。新入口：`t-assist` 或 `python -m triple_resonance.assistant.cli`。
 
-## 当前状态（v2.2，如实）
+软件功能与策略盈利是两项不同的验收。Setup A 始终为 **UNVALIDATED**，输出 `RESEARCH_CANDIDATE`，不承诺收益。
+根目录 `intraday.py` / `backtest.py` 保留为 v2 观察与历史基线；旧设计文档中的阶段状态和收益数字不代表本版本验收。
 
-五轮外部复审驱动的修复链（执行时序 → 统计口径 → 实验设计）之后，回测结论明确：
-
-- **三共振 60m 择时是负贡献**：段隔离后 final 段 +12.58% vs 等权 B&H +21.01%（超额 -8.44pp），Sharpe 0.89 vs 1.17
-- 因此**信号层已降级为观察模式**：只输出共振方向/分数/条件明细，不再产生 加仓/减仓/建仓 建议
-- **止损层保留**：这是当前工具仅存的实盘价值——止损位建仓时一次锁定（entry 锚定，不随价格/波动率漂移），破位即提示，上根 Low 破位事后告警
-- v3 方向：放弃"低频指标整仓择时"，改为**当日 T 结构**（15m 环境 → 5m setup → 1m/quote 执行，独立 T bucket，当日强制平仓）——设计文档见 [docs/v3-design.md](docs/v3-design.md)
-
-## 它做什么（现在）
-
-```
-美股持仓 → 15m/60m K 线 → RSI/MACD/EMA 三共振（观察）+ 锁定止损（风控）→ 终端状态
-```
-
-- **三共振观察**：趋势（EMA9>EMA21）+ 动量（MACD 柱同向且近期金叉/死叉）+ RSI 位置；输出方向与分数，明确告诉你**缺哪条**——但不构成交易建议
-- **只用已闭合 K 线**：丢弃正在形成的 bar，杜绝信号重绘
-- **成本锚定止损**：止损位在**建仓时一次锁定**（成本 − 1.5×ATR，或手动指定），持久化保存。止损**位**计算与回测一致；实时**触发**依赖券商止损单（本工具用已闭合 K 事后检查并告警"上根 Low 已破位"）
-- **持仓联动**：记录持仓后自动算浮盈亏、市值、锁定止损位
-- **内置回测引擎**：逐 bar 状态机、防前视、含交易成本、三段验证（train/validation/final **各自 flat 起跑，无跨段状态继承**）、统一时间戳分段边界、统一参数 warmup，组合收益/MaxDD/Sharpe 出自同一条初始 1.0 基准曲线，配有 9 项合成数据回归测试
-
-## 快速开始
+## 安装
 
 ```bash
-pip install -r requirements.txt
-
-# 扫描共振状态（默认 60m；15m 观察用 --interval 15m）
-python intraday.py scan AAPL NVDA TSLA
-
-# 只看指标
-python intraday.py quote AAPL
-
-# 记录持仓（之后扫描联动止损监控）
-python intraday.py position add AAPL 100 310.5 --note "底仓"
-python intraday.py position add AAPL 100 310.5 --stop 300   # 手动锁定止损价
-python intraday.py position set-stop AAPL 295               # 改锁定止损
-python intraday.py position list
-
-# 回测（60m / 2 年，默认联网刷新数据；--use-cache 复用本地缓存）
-python backtest.py --interval 60m --period 730d
-# 固定日期窗口（可复现，报告数字绑定数据集指纹）
-python backtest.py --interval 60m --start 2024-09-06 --end 2026-09-06
-
-# 回归测试（执行时序 4 项 + 统计口径/段隔离/warmup/止损锁定 5 项）
-python tests/test_backtest_engine.py
+python -m venv .venv
+source .venv/bin/activate
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install -e '.[dev]'
+python -m pytest -q
 ```
 
-## 信号规则（观察参考，非交易建议）
+Python 3.11+。本地交易日历不需要券商交易账户。行情凭据只读取环境变量，不应提交到 GitHub。
 
-| 方向 | 趋势 | 动量 | 位置 |
-|---|---|---|---|
-| 偏多（buy） | EMA9 > EMA21 | MACD 柱 > 0 且近 3 根内金叉 | RSI 35–65 健康区，或从 <30 上穿回 30 |
-| 偏空（sell） | EMA9 < EMA21 | MACD 柱 < 0 且近 3 根内死叉 | RSI > 65（严格，避免 65 同值双侧），或从 >70 回落 |
+## 初始化与看盘
 
-多空分数相同一律无方向。**持仓时止损优先于任何信号。**
+以下价格、股数和资金仅是命令格式示例，不是仓位建议。`--cash` 是额外预留的 T 现金，不是底仓市值。
+已有台账不能被 init 覆盖；新表使用独立命名空间，不会自动迁移或修改旧持仓表。
 
-## 回测现状
+```bash
+# 初始化只做一次。按实际资金与风险预算填写。
+t-assist --db state.db init --cash 1000 --risk 10 --daily-loss 25
+t-assist --db state.db register NVDA --base-qty 80 --base-cost 100 --max-t-qty 10
 
-详见 [docs/backtest-report-v2.md](docs/backtest-report-v2.md)（v2.2，段隔离验证）。核心事实：
-
-- 60m + 门槛 3 在 final 验证段（flat 起跑）收益 +12.58% vs 等权 B&H +21.01%（**超额 -8.44pp**）；此前"≈持平"是跨段持仓状态造成的假象
-- 15m 段隔离后超额 +1.31pp，但 5bps 成本即转负、Exposure 仅 25%，无可用优势
-- 择时信号不作为加减仓依据；工具定位 = **止损纪律层**
-
-## Roadmap（v3：当日 T 全链路）
-
-详细设计：[docs/v3-design.md](docs/v3-design.md)
-
-- [ ] **数据层**：券商 WebSocket（Alpaca 优先：trades/quotes/minute bars/order updates），yfinance 降级为研究 fallback；1m 历史数据（≥半年）
-- [ ] **仓位结构**：base（永久底仓，T 引擎不可动）+ T bucket（当日 T 仓，15:45 ET 强制清零）
-- [ ] **Setup A：顺势低吸 T**（第一版唯一策略）：15m opening range + VWAP + SPY/个股相对强弱定环境，5m 回踩关键位 + reclaim 确认入场
-- [ ] **结构止损 + 风险定仓**：pullback swing low / VWAP 失守 / OR 关键位失守；size = 允许亏损金额 ÷ (entry − stop)
-- [ ] **1m 粒度回测**（信号 5m / 环境 15m / 成交模拟 1m）——5m OHLC 无法分辨同 bar 内 TP/SL 先后
-- [ ] **Setup B：反向 T**（均值回归，独立回测，不与 Setup A 混一个 score）
-- [ ] T 引擎动作恢复（T_BUY/T_SELL/T_FLATTEN）——须先通过 1m 回测
-- [ ] 日内交易限制适配（FINRA 2026-06 新 intraday margin 框架过渡期至 2027-10，规则由 broker adapter 决定，不硬编码）
-
-## 项目结构
-
-```
-intraday.py    盘面观察引擎：取数 + 三共振（观察）+ 持仓联动 + 止损监控
-backtest.py    回测引擎：逐 bar 状态机、三段隔离验证、成本敏感性、paired 网格
-indicators.py  指标计算：RSI(Wilder)/MACD/EMA/ATR，纯 pandas，无前视
-docs/          策略参数说明 + 回测报告 v2.2 + v3 设计文档
-tests/         9 项回归测试（执行时序 4 + 统计口径/段隔离/warmup/止损锁定 5）
+# 预先在本机安全设置 APCA_API_KEY_ID / APCA_API_SECRET_KEY。
+# 不在命令参数中填写 secret；不需要接任何券商下单接口。
+t-assist --db state.db watch --symbols NVDA --benchmark SPY --feed iex
 ```
 
-## 免责声明
+可在 `--symbols` 后提供多个已登记个股。SPY 默认仅作市场环境基准。
+碎股台账可在 init 使用 `--quantity-step 0.001`；是否可以碎股交易仍须向自己的券商确认。
+候选形态附带风险/现金计划，但计划不预留资金，不是保证可成交的报价。
 
-本工具输出仅供研究参考，不构成投资建议。数据来自 Yahoo Finance（有延迟，非实盘级；实盘触发/止损成交请依赖券商订单系统）。日内交易受 PDT 与日内保证金规则约束——**FINRA 自 2026-06-04 起实施新 intraday margin 框架，过渡期内（至 2027-10-20）各券商规则不一**，请向自己的券商确认当前适用的日内交易限制。交易决策与盈亏由使用者自行承担。
+## 登记实际手动成交
 
-## License
+在自己的券商完成交易后，在另一终端登记真实成交。时间必须带时区，ID 应采用唯一成交编号。
 
-[MIT](LICENSE)
+```bash
+t-assist --db state.db fill --id broker-fill-001 --symbol NVDA --side buy \
+  --qty 2 --price 100 --fee 1 --at '2026-09-08T10:00:20-04:00' --stop 97 --target 104.5
+
+t-assist --db state.db status
+
+t-assist --db state.db fill --id broker-fill-002 --symbol NVDA --side sell \
+  --qty 2 --price 102 --fee 1 --at '2026-09-08T11:05:10-04:00'
+
+t-assist --db state.db reconcile NVDA --actual-total 80
+# 只有向券商核对过可用现金，才确认卖出回款可再次使用。
+t-assist --db state.db confirm-cash 1002
+```
+
+本例现金为 `1000 - 201 + 203 = 1002`，净 T 收益为2。
+相同成交ID、相同内容重复登记不会重复记账；冲突内容报错。支持部分成交和碎股。
+卖出数量超过本地 T 仓会报错，防止误动底仓；真实账户发生额外操作时须先核对，不应伪造一笔T成交。
+买入事实已发生但超过现金或数量上限时，会记录该事实并标记异常，而不是假装成交没有发生。
+
+`effective_cost_after_t` 是经济等效成本，不是券商或税务成本。
+新计划按实际现金、费用预算、已有持仓风险和日内次数限制计算；无法保证跳空时亏损不超过预算。
+
+## 提醒语义
+
+| 输出 | 含义 |
+|---|---|
+| `RESEARCH_CANDIDATE` | 完整闭合、时点同步的形态候选；策略未验证，不是买入指令 |
+| `STOP_REVIEW` / `TAKE_PROFIT_REVIEW` | 已接收的分钟 K 触及止损/目标；是事后复核提醒，不是成交 |
+| `T_FLATTEN_REQUIRED` | 收盘前15分钟提醒退出；提前收盘自动调整，断流时定时器仍工作 |
+| `RISK_DATA_STALE` / `DATA_INVALID` | 数据过期或不完整，不应依据旧信息操作 |
+| `OVERNIGHT_T_REQUIRES_REVIEW` | 前日 T 仓仍未登记平仓；不会跨日自动抹掉 |
+| `UNPROTECTED_POSITION` | 没有登记完整止损和目标位 |
+
+**提醒不会修改持仓数量。只有实际成交登记改变台账。**
+分钟级提醒不是逐笔实时保护，也不代替券商保护性订单。
+终端/进程退出后提醒也停止；退出时会提示检查未平仓 T 仓。
+
+## 回测、前向记录与导出
+
+```bash
+# 本地已下载的数据。默认三段，--full-discovery 可只跑全样本。
+python -m triple_resonance.backtest.run --symbol NVDA --spy SPY --feed iex
+# 资金与执行延迟压力测试，不调用任何交易接口。
+python -m triple_resonance.backtest.run --symbol NVDA --t-cash 1000 --fee 1 \
+  --slippage 0.0005 --execution-delay-minutes 1
+
+mkdir -p audit
+t-assist --db state.db watch --symbols NVDA --record audit/events.ndjson
+t-assist --db state.db export audit/ledger.json
+# 用另一个已初始化/登记的DB回放，避免污染真实台账的去重记录。
+t-assist --db replay.db replay --symbols NVDA --events audit/events.ndjson
+```
+
+新回测与实时共用决策时间边界：完整5m关闭、个股与基准同一时点、数据质量及截止门禁。
+入场分钟 SL/TP、跳空、双边费用与滑点、尾盘开盘退出都纳入模型。
+A 是相同总资金全部投入；B 是底仓加预留现金；C 是相同底仓加现金出资的 T。
+**C−B 用相同初始总资金作分母，不使用额外免费资金。**
+收益从实际现金变化派生，并断言等于所有交易净盈亏之和。
+持仓期缺分钟会标记 `INVALID_EXECUTION_COVERAGE`；没有有效尾盘数据则报错，不伪造陈旧价格成交。
+下一分钟开盘和1分钟延迟只是执行模型，不是实际收到信号后可拿到的价格。
+
+Parquet 增量合并保留历史，单写者锁和原子替换防冲突，manifest 含真实文件 SHA-256。
+后续更新可能改变文件；复现需归档当次数据和 manifest，不能只保留 hash。
+IEX 与 SIP 不可混作同口径数据；严格完整性门禁可能拒绝很多 IEX 稀疏分钟日，不能用填充数据伪造成交证据。
+
+## 使用边界
+
+本版本提供手动操作所需的软件流程，但没有把 Setup A 变成已验证策略。
+先用独立测试DB核对台账和提醒，再仅观察真实行情。是否据此交易应另行验证，不由单元测试决定。
+账户准入、结算、保证金及交易限制需自行核对，软件不推断券商规则，也没有下单权限。
+验收范围、未验证事项及变更详见 [docs/manual-assistant-release.md](docs/manual-assistant-release.md)。

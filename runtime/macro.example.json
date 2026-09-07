@@ -1,0 +1,12 @@
+{
+  "as_of": "2026-09-08T12:00:00Z",
+  "valid_until": "2026-09-08T20:00:00Z",
+  "risk": "normal",
+  "event": null,
+  "event_start": null,
+  "event_end": null,
+  "us10y": null,
+  "wti": null,
+  "vix": null,
+  "note": "EXAMPLE ONLY. Copy to runtime/macro.json and replace every field with a current verified snapshot before a session. Never treat this file as live market data."
+}

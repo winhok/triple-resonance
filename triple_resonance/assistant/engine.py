@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import timedelta
 from .calendar import Calendar, session_day, utc
-from .ledger import Ledger, number, symbol
+from .ledger import Ledger, number, symbol, dumps
 from .signals import decide, valid_bar
 
 
@@ -96,10 +96,8 @@ class Assistant:
 
     def _price_alerts(self, bar, now):
         p = self.ledger.position(bar.symbol)
-        if not p or number(p['qty']) <= 0:
+        if not p or number(p['qty']) <= 0 or p['protection_issues']:
             return
-        if p['protection_issues']:
-            return  # poll emits an unsafe-protection warning, not contradictory SL/TP touches
         end = utc(bar.ts) + timedelta(minutes=1)
         entered = utc(p['opened_at'])
         if end <= entered or (now - end).total_seconds() > self.max_age:
@@ -119,13 +117,7 @@ class Assistant:
                             note='Minute-bar touch detected after the event. Position stays open until you record a fill.'))
 
     def _exit_reminder(self, position, session, now):
-        """At most three durable reminders per session and position lifecycle.
-
-        Emit only the current stage after a late start, not a burst of missed
-        stages. No T_FLATTEN_REQUIRED is sent after the session close. Keys use
-        the entry timestamp (not quantity), so partial exits and restarts do not
-        reset the schedule; a genuinely new position receives its own warning.
-        """
+        """Three persistent stages per session/position, never a fabricated exit."""
         if session is None or now < session.force_flatten_at:
             return
         if now >= session.close_at:
@@ -151,6 +143,12 @@ class Assistant:
         minute = now.replace(second=0, microsecond=0).isoformat()
         for p in self.ledger.positions():
             sym = p['symbol']
+            # Operational failures are account-wide, even on a locally flat symbol.
+            if p['operational_blocked']:
+                self._send(f'operational:{sym}:{d}:{dumps(p["operational_blocks"])}',
+                           'ACCOUNT_OPERATIONAL_BLOCK', now,
+                           dict(symbol=sym, block_reasons=p['operational_blocks'],
+                                note='All new plans blocked. Confirm holdings and cash; actual fills remain recordable.'))
             if number(p['qty']) <= 0:
                 continue
             if session_day(p['opened_at']) < d:

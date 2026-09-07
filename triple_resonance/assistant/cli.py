@@ -4,26 +4,28 @@ import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from .calendar import Calendar, session_day, utc
+import sqlite3
+from .calendar import Calendar, session_day
 from .engine import Assistant
 from .ledger import Ledger, Policy, dumps
-from ..domain.models import Bar
 
 
 def output(obj):
-    print(json.dumps(obj, ensure_ascii=False, default=str), flush=True)
+    print(json.dumps(obj, ensure_ascii=False, default=str, allow_nan=False), flush=True)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description='Manual day-T assistant: market data + local ledger, NEVER submits broker orders')
-    ap.add_argument('--db', default='state.db', help='Local ledger DB; legacy tables are not overwritten')
+    ap.add_argument('--db', default='state.db', help='Local ledger DB; replay must use a NEW nonexistent path')
     sub = ap.add_subparsers(dest='cmd', required=True)
     p = sub.add_parser('init', help='Initialize dedicated T cash reserve, not base market value')
     p.add_argument('--cash', required=True)
     p.add_argument('--risk', default='10')
     p.add_argument('--daily-loss', default='25')
     p.add_argument('--quantity-step', default='1')
-    p.add_argument('--estimated-fees', default='2')
+    p.add_argument('--estimated-fees', default='2', help='Estimated roundtrip fees for a NEW position')
+    p.add_argument('--estimated-exit-fee', default=None,
+                   help='Remaining exit fee per OPEN position; omitted conservatively reserves the full roundtrip estimate')
     p.add_argument('--recycle-sale-proceeds', action='store_true', help='Only after confirming your account permits reuse')
     p = sub.add_parser('register')
     p.add_argument('symbol'); p.add_argument('--base-qty', required=True)
@@ -40,25 +42,36 @@ def main(argv=None):
     p.add_argument('available')
     p = sub.add_parser('reconcile')
     p.add_argument('symbol'); p.add_argument('--actual-total', required=True)
-    p = sub.add_parser('plan', help='Risk/cash sizing only; not an entry signal')
+    p = sub.add_parser('plan', help='Risk/cash sizing only; not an entry signal or a cash reservation')
     p.add_argument('symbol'); p.add_argument('--entry', required=True); p.add_argument('--stop', required=True)
     sub.add_parser('status')
     p = sub.add_parser('export'); p.add_argument('path')
-    for name in ['watch', 'replay']:
-        p = sub.add_parser(name)
-        p.add_argument('--symbols', nargs='+', required=True)
-        p.add_argument('--benchmark', default='SPY')
-        p.add_argument('--rs-threshold', type=float, default=0)
-        if name == 'watch':
-            p.add_argument('--feed', choices=['iex', 'sip'], default='iex'); p.add_argument('--record')
-        else:
-            p.add_argument('--events', required=True, help='NDJSON recorded by watch; use a separate replay DB')
+    p = sub.add_parser('watch')
+    p.add_argument('--symbols', nargs='+', required=True)
+    p.add_argument('--benchmark', default='SPY')
+    p.add_argument('--rs-threshold', type=float, default=0)
+    p.add_argument('--feed', choices=['iex', 'sip'], default='iex')
+    p.add_argument('--record', help='NEW self-contained v2 NDJSON tape; existing recordings are never appended/overwritten')
+    p = sub.add_parser('replay', help='Verify a complete v2 tape and create a NEW isolated ledger')
+    p.add_argument('--events', required=True)
+    # Old flags are accepted for compatibility but never override recorded config.
+    p.add_argument('--symbols', nargs='+', help=argparse.SUPPRESS)
+    p.add_argument('--benchmark', help=argparse.SUPPRESS)
+    p.add_argument('--rs-threshold', type=float, help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
-    ledger = Ledger(a.db)
+    ledger = None
     now = datetime.now(timezone.utc)
     try:
+        if a.cmd == 'replay':
+            if a.symbols or a.benchmark is not None or a.rs_threshold is not None:
+                raise ValueError('Replay uses the recorded configuration; omit symbols/benchmark/threshold flags')
+            from .journal import replay_file
+            output(replay_file(a.events, a.db, emit=output))
+            return 0
+        ledger = Ledger(a.db)
         if a.cmd == 'init':
-            ledger.initialize(a.cash, Policy(a.risk, a.daily_loss, 1, a.quantity_step, a.estimated_fees, a.recycle_sale_proceeds))
+            ledger.initialize(a.cash, Policy(a.risk, a.daily_loss, 1, a.quantity_step,
+                                            a.estimated_fees, a.recycle_sale_proceeds, a.estimated_exit_fee))
             output({'type': 'INITIALIZED', 'execution': 'MANUAL_ONLY'})
         elif a.cmd == 'register':
             ledger.register(a.symbol, a.base_qty, a.base_cost, a.max_t_qty); output(ledger.position(a.symbol))
@@ -85,26 +98,21 @@ def main(argv=None):
             output({'export': str(target)})
         else:
             ledger.account()
-            app = Assistant(ledger, a.symbols, a.benchmark, rs_threshold=a.rs_threshold, emit=output)
-            if a.cmd == 'watch':
-                from .runtime import watch
-                watch(app, feed=a.feed, record_path=a.record)
-            else:
-                with open(a.events, encoding='utf-8') as f:
-                    previous = None
-                    for line in f:
-                        event = json.loads(line)
-                        at = utc(event.get('processed_at', event['received_at']))
-                        if previous and at < previous:
-                            raise ValueError('Processing-time replay must be ordered')
-                        previous = at
-                        b = event['bar']; b['ts'] = utc(b['ts'])
-                        app.on_bar(Bar(**b), at); app.poll(at)
-    except (ValueError, OSError, ImportError) as exc:
+            from .ledger import symbol
+            symbols = set(map(symbol, a.symbols))
+            # Include every existing open T position for risk monitoring, not just
+            # the requested research watchlist. Other new symbols warn as stale.
+            symbols.update(p['symbol'] for p in ledger.positions() if float(p['qty']) > 0)
+            for sym in symbols:
+                if not ledger.position(sym): raise ValueError(f'Register {sym} before watch')
+            app = Assistant(ledger, sorted(symbols), a.benchmark, rs_threshold=a.rs_threshold, emit=output)
+            from .runtime import watch
+            watch(app, feed=a.feed, record_path=a.record)
+    except (ValueError, OSError, ImportError, sqlite3.Error) as exc:
         output({'type': 'ERROR', 'message': str(exc)})
         return 2
     finally:
-        ledger.close()
+        if ledger is not None: ledger.close()
     return 0
 
 

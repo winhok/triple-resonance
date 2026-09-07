@@ -1,114 +1,124 @@
-# triple-resonance — 手动日 T 操作助手
+# triple-resonance 0.3.2 — 手动日 T 操作助手
 
-**仅行情、研究、计划、手动成交台账与提醒，不连接任何券商下单接口。**
-本次改造基于 `d6aeda7`。新入口：`t-assist` 或 `python -m triple_resonance.assistant.cli`。
+**只接行情；计划、手动成交台账、持仓核算、风险复核、尾盘提醒和录制回放均在本地。没有券商下单接口。**
 
-软件功能与策略盈利是两项不同的验收。Setup A 始终为 **UNVALIDATED**，输出 `RESEARCH_CANDIDATE`，不承诺收益。
-根目录 `intraday.py` / `backtest.py` 保留为 v2 观察与历史基线；旧设计文档中的阶段状态和收益数字不代表本版本验收。
+主入口：`t-assist` 或 `python -m triple_resonance.assistant.cli`。Setup A 保持 `UNVALIDATED / RESEARCH_CANDIDATE`：软件操作流程与策略盈利分别验收，候选不是买入指令。
 
-## 安装
+## 安装或升级
 
 ```bash
+git pull --ff-only
 python -m venv .venv
 source .venv/bin/activate
 # Windows PowerShell: .venv\Scripts\Activate.ps1
 python -m pip install -e '.[dev]'
 python -m pytest -q
+python tests/test_backtest_engine.py
+t-assist --help
 ```
 
-Python 3.11+。本地交易日历不需要券商交易账户。行情凭据只读取环境变量，不应提交到 GitHub。
+Python 3.11+。升级前停止旧 watch，备份本地数据库及其 WAL/SHM（或关闭所有连接后复制数据库）。已有 `state.db` 可继续使用，**不要再次 init，不要重建真实持仓**。旧策略与观察脚本仍保留，安装后用上述新入口。
 
-## 初始化与看盘
+## 首次初始化
 
-以下价格、股数和资金仅是命令格式示例，不是仓位建议。`--cash` 是额外预留的 T 现金，不是底仓市值。
-已有台账不能被 init 覆盖；新表使用独立命名空间，不会自动迁移或修改旧持仓表。
+以下资金、股数、价格均为命令示例，不是仓位建议。`--cash` 是额外预留的 T 现金，不包含底仓市值。先核对券商账户规则、真实持仓和可用现金。
 
 ```bash
-# 初始化只做一次。按实际资金与风险预算填写。
-t-assist --db state.db init --cash 1000 --risk 10 --daily-loss 25
+# 只做一次。按实际风险预算、费用与可用现金填写。
+t-assist --db state.db init --cash 1000 --risk 10 --daily-loss 25 \
+  --estimated-fees 2 --estimated-exit-fee 1
 t-assist --db state.db register NVDA --base-qty 80 --base-cost 100 --max-t-qty 10
-
-# 预先在本机安全设置 APCA_API_KEY_ID / APCA_API_SECRET_KEY。
-# 不在命令参数中填写 secret；不需要接任何券商下单接口。
-t-assist --db state.db watch --symbols NVDA --benchmark SPY --feed iex
 ```
 
-可在 `--symbols` 后提供多个已登记个股。SPY 默认仅作市场环境基准。
-碎股台账可在 init 使用 `--quantity-step 0.001`；是否可以碎股交易仍须向自己的券商确认。
-候选形态附带风险/现金计划，但计划不预留资金，不是保证可成交的报价。
+`--estimated-fees` 是新仓位往返的预计费用；`--estimated-exit-fee` 是每个已有 T 仓仍待支付的退出费用。旧配置或省略退出费时，保守地用全部往返费用预留退出费，不假设买卖费用对称。实际手续费仍由每笔 `fill --fee` 记账。分批卖出的总退出费、滑点与跳空可能超过估算，应按实际使用方式设置预算。
 
-## 登记实际手动成交
+碎股可在初始化时配置 `--quantity-step 0.001`；实际可交易单位与资格由券商决定。默认不自动复用卖出回款；只有核对后才 `confirm-cash`，不自动推断结算规则。
 
-在自己的券商完成交易后，在另一终端登记真实成交。时间必须带时区，ID 应采用唯一成交编号。
+## 观察与录制
+
+在本机安全配置 `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY`。不要把密钥写入命令参数、源码或 GitHub。
 
 ```bash
-t-assist --db state.db fill --id broker-fill-001 --symbol NVDA --side buy \
+mkdir -p audit
+t-assist --db state.db watch --symbols NVDA --benchmark SPY --feed iex \
+  --record audit/session-001.ndjson
+```
+
+多个已登记个股可一起传给 `--symbols`；启动时会把台账中已有的未平 T 仓加入监控。运行中新增另一只未订阅的持仓会告警数据缺失，应停止并重新指定监控池。IEX/SIP 的数据口径不混用；分钟完整性不足时不伪造 VWAP 或买点。
+
+每次使用**新的录制文件名**，不会覆盖或追加到旧文件。Ctrl+C 正常退出会写结束校验记录，仓位不会被标为已卖出。进程关闭后提醒停止。
+
+## 手动成交、核对与计划
+
+在券商实际成交后，另开终端登记真实成交编号、价格、费用和带时区时间。
+
+```bash
+t-assist --db state.db fill --id fill-001 --symbol NVDA --side buy \
   --qty 2 --price 100 --fee 1 --at '2026-09-08T10:00:20-04:00' --stop 97 --target 104.5
 
 t-assist --db state.db status
 
-t-assist --db state.db fill --id broker-fill-002 --symbol NVDA --side sell \
+t-assist --db state.db fill --id fill-002 --symbol NVDA --side sell \
   --qty 2 --price 102 --fee 1 --at '2026-09-08T11:05:10-04:00'
 
 t-assist --db state.db reconcile NVDA --actual-total 80
-# 只有向券商核对过可用现金，才确认卖出回款可再次使用。
 t-assist --db state.db confirm-cash 1002
 ```
 
-本例现金为 `1000 - 201 + 203 = 1002`，净 T 收益为2。
-相同成交ID、相同内容重复登记不会重复记账；冲突内容报错。支持部分成交和碎股。
-卖出数量超过本地 T 仓会报错，防止误动底仓；真实账户发生额外操作时须先核对，不应伪造一笔T成交。
-买入事实已发生但超过现金或数量上限时，会记录该事实并标记异常，而不是假装成交没有发生。
-
-`effective_cost_after_t` 是经济等效成本，不是券商或税务成本。
-新计划按实际现金、费用预算、已有持仓风险和日内次数限制计算；无法保证跳空时亏损不超过预算。
-
-## 提醒语义
-
-| 输出 | 含义 |
-|---|---|
-| `RESEARCH_CANDIDATE` | 完整闭合、时点同步的形态候选；策略未验证，不是买入指令 |
-| `STOP_REVIEW` / `TAKE_PROFIT_REVIEW` | 已接收的分钟 K 触及止损/目标；是事后复核提醒，不是成交 |
-| `T_FLATTEN_REQUIRED` | 收盘前15分钟提醒退出；提前收盘自动调整，断流时定时器仍工作 |
-| `RISK_DATA_STALE` / `DATA_INVALID` | 数据过期或不完整，不应依据旧信息操作 |
-| `OVERNIGHT_T_REQUIRES_REVIEW` | 前日 T 仓仍未登记平仓；不会跨日自动抹掉 |
-| `UNPROTECTED_POSITION` | 没有登记完整止损和目标位 |
-
-**提醒不会修改持仓数量。只有实际成交登记改变台账。**
-分钟级提醒不是逐笔实时保护，也不代替券商保护性订单。
-终端/进程退出后提醒也停止；退出时会提示检查未平仓 T 仓。
-
-## 回测、前向记录与导出
+例中现金 `1000 - 201 + 203 = 1002`，净 T 盈利为2。相同 ID/相同内容重复登记不重复记账，冲突 ID 拒绝。支持碎股、部分成交、重启恢复；卖超本地 T 仓拒绝，不能借 T 引擎误动底仓。
 
 ```bash
-# 本地已下载的数据。默认三段，--full-discovery 可只跑全样本。
-python -m triple_resonance.backtest.run --symbol NVDA --spy SPY --feed iex
-# 资金与执行延迟压力测试，不调用任何交易接口。
-python -m triple_resonance.backtest.run --symbol NVDA --t-cash 1000 --fee 1 \
-  --slippage 0.0005 --execution-delay-minutes 1
-
-mkdir -p audit
-t-assist --db state.db watch --symbols NVDA --record audit/events.ndjson
-t-assist --db state.db export audit/ledger.json
-# 用另一个已初始化/登记的DB回放，避免污染真实台账的去重记录。
-t-assist --db replay.db replay --symbols NVDA --events audit/events.ndjson
+# 只计算风险/现金允许数量，不是信号，也不预留现金。
+t-assist --db state.db plan NVDA --entry 100 --stop 97
+# 明确修正当前 T 仓的保护参数。
+t-assist --db state.db set-risk NVDA --stop 98 --target 104.5
 ```
 
-新回测与实时共用决策时间边界：完整5m关闭、个股与基准同一时点、数据质量及截止门禁。
-入场分钟 SL/TP、跳空、双边费用与滑点、尾盘开盘退出都纳入模型。
-A 是相同总资金全部投入；B 是底仓加预留现金；C 是相同底仓加现金出资的 T。
-**C−B 用相同初始总资金作分母，不使用额外免费资金。**
-收益从实际现金变化派生，并断言等于所有交易净盈亏之和。
-持仓期缺分钟会标记 `INVALID_EXECUTION_COVERAGE`；没有有效尾盘数据则报错，不伪造陈旧价格成交。
-下一分钟开盘和1分钟延迟只是执行模型，不是实际收到信号后可拿到的价格。
+### 账户级风险门禁
 
-Parquet 增量合并保留历史，单写者锁和原子替换防冲突，manifest 含真实文件 SHA-256。
-后续更新可能改变文件；复现需归档当次数据和 manifest，不能只保留 hash。
-IEX 与 SIP 不可混作同口径数据；严格完整性门禁可能拒绝很多 IEX 稀疏分钟日，不能用填充数据伪造成交证据。
+任一标的有未解决的数量/资金/对账异常，即使该标的本地 T 仓为零，也阻止其他股票的新计划。失效保护、隔夜 T 仓、已触发但尚未处理的退出锁同样不会被当作“零风险”。
 
-## 使用边界
+`status` 给出独立的 `operational_blocks` 与 `protection_issues`：
 
-本版本提供手动操作所需的软件流程，但没有把 Setup A 变成已验证策略。
-先用独立测试DB核对台账和提醒，再仅观察真实行情。是否据此交易应另行验证，不由单元测试决定。
-账户准入、结算、保证金及交易限制需自行核对，软件不推断券商规则，也没有下单权限。
-验收范围、未验证事项及变更详见 [docs/manual-assistant-release.md](docs/manual-assistant-release.md)。
+- `POSITION_MISMATCH`：核对实际数量，用 `reconcile` 确认；不修改真实成交。
+- `CASH_REVIEW_REQUIRED`：核对券商可用现金，用 `confirm-cash` 确认；数量对账不能代替现金确认。
+- `T_QUANTITY_EXCEEDED`：只有登记实际减仓至上限内才解除，不能靠确认数量洗掉。
+- `LEGACY_REVIEW_REQUIRED`：旧版只有一个异常布尔值，来源无法区分；依次核对数量和现金，不自动放行。
+
+保护参数修正不会解除独立的操作阻断或退出锁。记录已经发生的实际买卖仍然允许；提醒与计划永远不生成虚构成交。
+
+每日预算同时预留已有仓位的止损价差风险与**剩余退出费用**。计划读取同一事务快照，不能在并发登记成交时混用不同时间的现金与仓位。两个并行计划仍不是资金预约，手动成交前须再次核对最新计划与实际报价。
+
+## 提醒
+
+`STOP_REVIEW / TAKE_PROFIT_REVIEW` 是已收到分钟 K 的触及复核，不是逐笔实时止损。`RISK_DATA_STALE / DATA_INVALID` 表示不应依赖旧数据操作。
+
+尾盘按交易日历触发：收盘前15分钟 initial、前5分钟 urgent、收盘时或其后首次检查 closed；每阶段每段持仓一次，持久化去重。提前收盘跟随实际 session。断流时本地计时器仍提醒；**只有登记真实卖出才更新股数**。
+
+## 可验证录制与回放
+
+v2 录制保存初始台账、历史回补、实时/修订分钟、定时检查、行情断流状态、实际 session，以及另一个终端登记的成交/风险/现金/对账变化。按真实处理顺序回放，并验证每个输入后的输出与台账哈希。
+
+```bash
+# replay-001.db 必须不存在；不需要先 init/register，也不要传 symbols。
+t-assist --db audit/replay-001.db replay --events audit/session-001.ndjson
+# 成功才输出 REPLAY_VERIFIED 并创建回放数据库。
+t-assist --db audit/replay-001.db status
+t-assist --db state.db export audit/ledger-001.json
+```
+
+回放不会联网，不打开或覆盖现有真实数据库。序号/哈希错误、截断、缺少结束记录、语义不一致均失败，不发布“验证成功”的台账。旧版仅记录实时 bar 的文件缺少输入，不能自动补造成完整回放。录像保留版本；使用匹配版本回放。
+
+录制含私人资金与交易数据，不含 API 密钥；不要提交到公开仓库。哈希用于检测意外修改与缺失，不是防恶意重签的数字签名。录制写入失败会停止监控并明确警告，不能继续宣称审计完整。
+
+## 回测与适用边界
+
+```bash
+python -m triple_resonance.backtest.run --symbol NVDA --spy SPY --feed iex
+python -m triple_resonance.backtest.run --symbol NVDA --t-cash 1000 --fee 1 \
+  --slippage 0.0005 --execution-delay-minutes 1
+```
+
+保留已有 next-minute-open、入场分钟 SL/TP、跳空与双边费用/滑点模型。A/B/C 使用相同初始总资金，T 仓有现金约束；持仓期缺数不伪造成交。旧收益数字不能证明当前策略盈利。
+
+软件提供人工看护下的操作辅助流程，不承诺信号收益、实盘成交价或自动保护。首次在自己的机器上核对行情权限、网络、台账与提醒；真实买卖始终由用户决定并执行。详见 `docs/operating-release-0.3.2.md`。

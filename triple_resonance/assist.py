@@ -16,7 +16,8 @@ from .bars.aggregator import aggregate_closed
 from .data.alpaca_live import AlpacaLiveProvider
 from .domain.models import Bar, MarketContext, SetupSignal
 from .domain.session import BacktestSessionProvider, MarketSession
-from .strategy.context import DataQualityError, build_context, validate_session_data
+from .strategy.context import (DataQualityError, build_context, session_bounds_like,
+                               validate_session_data)
 from .strategy.trend_pullback import detect_trend_pullback
 
 
@@ -29,6 +30,9 @@ def assist_decision(stock_bars: List[Bar], spy_bars: List[Bar],
     """
     if len(stock_bars) < 15 or len(spy_bars) < 15:
         return None, None
+    # 决策只允许双方同一分钟都已闭合；不拿旧 SPY 与新个股行情拼上下文。
+    if stock_bars[-1].ts != spy_bars[-1].ts:
+        return None, None
     try:
         open_ts = validate_session_data(stock_bars, spy_bars, session)
         ctx = build_context(stock_bars, spy_bars, session)
@@ -36,6 +40,10 @@ def assist_decision(stock_bars: List[Bar], spy_bars: List[Bar],
         return None, None
     # Alpaca bar 事件代表这一分钟已经闭合，所以下一分钟边界才是 as_of。
     as_of = stock_bars[-1].ts + timedelta(minutes=1)
+    _, close_ts = session_bounds_like(session, stock_bars[0].ts)
+    entry_cutoff = close_ts - timedelta(minutes=30)
+    if as_of >= entry_cutoff:
+        return None, ctx
     bars_5m = aggregate_closed(stock_bars, 5, as_of, open_ts)
     opening_range_end = open_ts + timedelta(minutes=15)
     sig = detect_trend_pullback(ctx, bars_5m, opening_range_end, rs_threshold)
@@ -83,8 +91,6 @@ def _run_live(symbols: List[str], feed: str, rs_threshold: float) -> None:
         rolling[b.symbol].append(b)
         # 历史与 WebSocket 边界可能重叠，按 timestamp 去重并排序。
         rolling[b.symbol] = sorted({x.ts: x for x in rolling[b.symbol]}.values(), key=lambda x: x.ts)
-        if b.symbol != stock_sym:
-            return
         sb = rolling[stock_sym]
         pb = rolling.get(spy_sym, [])
         if len(sb) < 15 or len(pb) < 15:

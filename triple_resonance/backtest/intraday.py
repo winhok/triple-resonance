@@ -3,7 +3,8 @@
 关键设计（用户 P3 复审）：
   - 这是"当日 overlay 事件引擎"，不是旧 v2 的波段/整仓择时器
   - 1m 是唯一 truth source；5m 由 aggregator 现场聚合用于 setup 检测
-  - 每个交易日：09:30 起监控，Setup A 触发→定仓→结构止损/1.5R 止盈/15:45 强制 flatten
+  - 分钟执行顺序：开盘执行信号 → 开盘跳空检查 → 柱内 SL/TP（同时触及时止损优先）
+    → 收盘产生后续信号；15:45 起始时按该分钟 Open 强制 flatten
   - 不变式：收盘 t_shares 必为 0（强制 flatten 保证）
   - 组合定义采用 base + percentage-of-base overlay：
         A = 100% Base B&H（市场基准）
@@ -174,10 +175,11 @@ def run_backtest(stock_symbol: str, spy_symbol: str, store: ParquetStore,
 
         for i, bar in enumerate(sday):
             ts = bar.ts
-            # 15:45 强制平仓（不可关闭）
+            # force_flatten_at 表示该分钟开始即退出，因此使用 Open，而不是提前读取 Close。
             if ts >= force_flatten and not eng.state.is_flat:
-                r = eng.flatten(bar.close, _iso(bar.ts), fee=fee_per_trade)
-                _finalize(cur, bar, r, all_trades)
+                exit_px = bar.open * (1 - slippage)
+                r = eng.flatten(exit_px, _iso(bar.ts), fee=fee_per_trade)
+                _finalize(cur, bar, r, all_trades, exit_px=exit_px)
                 cur = None
                 continue
             # 检测 + 开仓
@@ -208,24 +210,38 @@ def run_backtest(stock_symbol: str, spy_symbol: str, store: ParquetStore,
                         "entry_fee": float(fee_per_trade),
                     }
                     entry_done = True
-                    continue
-            # 监控持仓：先止损后止盈
+                    # 入场发生在本分钟 Open；本分钟后续 High/Low 已属于持仓期，不可跳过。
+
+            # 监控持仓：先处理开盘跳空，再处理柱内路径；柱内同时触及时保守地止损优先。
             if cur is not None and not eng.state.is_flat:
                 cur["min_low"] = min(cur["min_low"], bar.low)
                 cur["max_high"] = max(cur["max_high"], bar.high)
-                if bar.low <= cur["stop"]:
-                    r = eng.t_sell(cur["size"], cur["stop"], _iso(bar.ts), fee=fee_per_trade)
-                    _finalize(cur, bar, r, all_trades, exit_px=cur["stop"])
+                if bar.open <= cur["stop"]:
+                    exit_px = bar.open * (1 - slippage)
+                    r = eng.t_sell(cur["size"], exit_px, _iso(bar.ts), fee=fee_per_trade)
+                    _finalize(cur, bar, r, all_trades, exit_px=exit_px)
+                    cur = None
+                elif bar.open >= cur["tp"]:
+                    exit_px = bar.open * (1 - slippage)
+                    r = eng.t_sell(cur["size"], exit_px, _iso(bar.ts), fee=fee_per_trade)
+                    _finalize(cur, bar, r, all_trades, exit_px=exit_px)
+                    cur = None
+                elif bar.low <= cur["stop"]:
+                    exit_px = cur["stop"] * (1 - slippage)
+                    r = eng.t_sell(cur["size"], exit_px, _iso(bar.ts), fee=fee_per_trade)
+                    _finalize(cur, bar, r, all_trades, exit_px=exit_px)
                     cur = None
                 elif bar.high >= cur["tp"]:
-                    r = eng.t_sell(cur["size"], cur["tp"], _iso(bar.ts), fee=fee_per_trade)
-                    _finalize(cur, bar, r, all_trades, exit_px=cur["tp"])
+                    exit_px = cur["tp"] * (1 - slippage)
+                    r = eng.t_sell(cur["size"], exit_px, _iso(bar.ts), fee=fee_per_trade)
+                    _finalize(cur, bar, r, all_trades, exit_px=exit_px)
                     cur = None
 
         # 安全网：循环结束仍有持仓（理论上 flatten 已处理）
         if cur is not None:
-            r = eng.flatten(sday[-1].close, _iso(sday[-1].ts), fee=fee_per_trade)
-            _finalize(cur, sday[-1], r, all_trades)
+            exit_px = sday[-1].close * (1 - slippage)
+            r = eng.flatten(exit_px, _iso(sday[-1].ts), fee=fee_per_trade)
+            _finalize(cur, sday[-1], r, all_trades, exit_px=exit_px)
             cur = None
 
         res.n_days += 1

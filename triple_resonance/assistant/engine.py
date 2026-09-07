@@ -98,6 +98,8 @@ class Assistant:
         p = self.ledger.position(bar.symbol)
         if not p or number(p['qty']) <= 0:
             return
+        if p['protection_issues']:
+            return  # poll emits an unsafe-protection warning, not contradictory SL/TP touches
         end = utc(bar.ts) + timedelta(minutes=1)
         entered = utc(p['opened_at'])
         if end <= entered or (now - end).total_seconds() > self.max_age:
@@ -116,6 +118,31 @@ class Assistant:
                             last_close=bar.close, bar_start=utc(bar.ts).isoformat(),
                             note='Minute-bar touch detected after the event. Position stays open until you record a fill.'))
 
+    def _exit_reminder(self, position, session, now):
+        """At most three durable reminders per session and position lifecycle.
+
+        Emit only the current stage after a late start, not a burst of missed
+        stages. No T_FLATTEN_REQUIRED is sent after the session close. Keys use
+        the entry timestamp (not quantity), so partial exits and restarts do not
+        reset the schedule; a genuinely new position receives its own warning.
+        """
+        if session is None or now < session.force_flatten_at:
+            return
+        if now >= session.close_at:
+            stage, kind = 'closed', 'T_UNFLATTENED_AT_CLOSE'
+        elif now >= session.close_at - timedelta(minutes=5):
+            stage, kind = 'urgent', 'T_FLATTEN_REQUIRED'
+        else:
+            stage, kind = 'initial', 'T_FLATTEN_REQUIRED'
+        sym = position['symbol']
+        if not position['exit_latched']:
+            self.ledger.latch_exit(sym)
+        key = f'flatten:{sym}:{session.trading_date}:{position["opened_at"]}:{stage}'
+        self._send(key, kind, now,
+                   dict(symbol=sym, qty=position['qty'], stage=stage,
+                        close_at=session.close_at.isoformat(),
+                        note='Manual review required; alert does not change holdings or imply execution.'))
+
     def poll(self, now):
         """Run from a timer even when no market messages arrive."""
         now = utc(now)
@@ -129,14 +156,14 @@ class Assistant:
             if session_day(p['opened_at']) < d:
                 self._send(f'overnight:{sym}:{d}', 'OVERNIGHT_T_REQUIRES_REVIEW', now,
                            dict(symbol=sym, qty=p['qty'], note='Not erased or marked as filled. Check the actual account.'))
-            if p['stop'] is None or p['target'] is None:
-                self._send(f'unprotected:{sym}:{p["opened_at"]}', 'UNPROTECTED_POSITION', now,
-                           dict(symbol=sym, qty=p['qty']))
-            if ss and now >= ss.force_flatten_at:
-                self.ledger.latch_exit(sym)
-                self._send(f'flatten:{sym}:{minute}', 'T_FLATTEN_REQUIRED', now,
-                           dict(symbol=sym, qty=p['qty'], close_at=ss.close_at.isoformat(),
-                                note='Manual action required; alert does not change holdings.'))
+            if p['protection_issues']:
+                missing = p['stop'] is None or p['target'] is None
+                kind = 'UNPROTECTED_POSITION' if missing else 'UNSAFE_PROTECTION'
+                key = f'protection:{sym}:{p["opened_at"]}:{p["stop"]}:{p["target"]}:{p["protection_issues"]}'
+                self._send(key, kind, now,
+                           dict(symbol=sym, qty=p['qty'], protection_issues=p['protection_issues'],
+                                note='New plans are blocked account-wide until protection is corrected or the actual exit is recorded.'))
+            self._exit_reminder(p, ss, now)
             bm = self.bars.get(sym, {})
             last = max(bm) + timedelta(minutes=1) if bm else None
             if ss and ss.open_at <= now < ss.close_at and (last is None or (now-last).total_seconds() > self.max_age):

@@ -39,6 +39,56 @@ def dumps(value):
     return json.dumps(value, default=str, sort_keys=True, separators=(',', ':'))
 
 
+def protection_issues(position: dict) -> list[str]:
+    """Validate entry-relative protection without discarding an actual fill.
+
+    Both the remaining position's average and its latest buy price must lie
+    strictly inside the protective range. A partial fill can otherwise leave
+    a stale stop/target on the wrong side of its execution price. Legacy rows
+    without last_buy_price use their recorded average; reads revalidate them.
+    This does not certify a current quote or an executable stop order.
+    """
+    if number(position['qty']) <= 0:
+        return []
+    issues = []
+    try:
+        references = [number(position['avg'], positive=True)]
+        if position.get('last_buy_price') is not None:
+            references.append(number(position['last_buy_price'], positive=True))
+    except ValueError:
+        return ['INVALID_ENTRY_REFERENCE']
+    levels = {}
+    for field in ('stop', 'target'):
+        if position.get(field) is None:
+            issues.append('MISSING_' + field.upper())
+        else:
+            try:
+                levels[field] = number(position[field], positive=True)
+            except ValueError:
+                issues.append('INVALID_' + field.upper())
+    stop, target = levels.get('stop'), levels.get('target')
+    if stop is not None and stop >= min(references):
+        issues.append('STOP_NOT_BELOW_ENTRY')
+    if target is not None and target <= max(references):
+        issues.append('TARGET_NOT_ABOVE_ENTRY')
+    if stop is not None and target is not None and target <= stop:
+        issues.append('TARGET_NOT_ABOVE_STOP')
+    return issues
+
+
+def refresh_safety(position: dict) -> dict:
+    """Keep protection blocks independent of cash/quantity/reconciliation blocks.
+
+    A successful quantity reconciliation cannot clear unsafe protection, and
+    fixing protection cannot clear an unrelated operational block or exit latch.
+    Existing JSON payloads are supported without rewriting their fill history.
+    """
+    position.setdefault('operational_blocked', bool(position.get('blocked', False)))
+    position['protection_issues'] = protection_issues(position)
+    position['blocked'] = bool(position['operational_blocked'] or position['protection_issues'])
+    return position
+
+
 @dataclass(frozen=True)
 class Policy:
     risk_per_trade: str = '10'
@@ -126,12 +176,13 @@ class Ledger:
 
     def position(self, sym):
         row = self.db.execute('SELECT payload FROM manual_position WHERE symbol=?', (symbol(sym),)).fetchone()
-        return json.loads(row[0]) if row else None
+        return refresh_safety(json.loads(row[0])) if row else None
 
     def positions(self):
-        return [json.loads(r[0]) for r in self.db.execute('SELECT payload FROM manual_position ORDER BY symbol')]
+        return [refresh_safety(json.loads(r[0])) for r in self.db.execute('SELECT payload FROM manual_position ORDER BY symbol')]
 
     def _save(self, p):
+        refresh_safety(p)
         self.db.execute('INSERT INTO manual_position VALUES (?,?) ON CONFLICT(symbol) DO UPDATE SET payload=excluded.payload',
                         (p['symbol'], dumps(p)))
 
@@ -172,6 +223,7 @@ class Ledger:
                 total = before + qty
                 p['avg'] = str((before * avg + qty * price) / total)
                 p['qty'] = str(total)
+                p['last_buy_price'] = str(price)
                 if entry:
                     p['opened_at'] = at.isoformat()
                     p['stop'] = str(stop) if stop is not None else None
@@ -181,7 +233,7 @@ class Ledger:
                 elif stop is not None and p['stop'] != str(stop):
                     raise ValueError('Partial fill stop differs; use set-risk explicitly')
                 cash -= qty * price + fee
-                if cash - held < 0 or total > number(p['max_t_qty']): p['blocked'] = True
+                if cash - held < 0 or total > number(p['max_t_qty']): p['operational_blocked'] = True
             else:
                 if qty > before: raise ValueError('Sell exceeds recorded T quantity; base is protected. Reconcile actual account.')
                 realized += (price - avg) * qty
@@ -190,7 +242,7 @@ class Ledger:
                 if not policy.recycle_sale_proceeds: held += max(ZERO, proceeds)
                 p['qty'] = str(before - qty)
                 if before == qty:
-                    p.update(avg='0', stop=None, target=None, opened_at=None, exit_latched=False)
+                    p.update(avg='0', stop=None, target=None, opened_at=None, exit_latched=False, last_buy_price=None)
             p['last_fill_at'] = at.isoformat()
             p['cumulative_pnl'] = str(number(p['cumulative_pnl']) + realized)
             self._save(p)
@@ -237,6 +289,9 @@ class Ledger:
             p = self.position(sym)
             if not p or number(p['qty']) <= 0: raise ValueError('No T position')
             p.update(stop=str(stop), target=str(target))
+            issues = protection_issues(p)
+            if issues:
+                raise ValueError('Unsafe protection: ' + ', '.join(issues))
             self._save(p)
             self._event('risk:'+symbol(sym)+':'+utc(at).isoformat(), 'MANUAL_RISK_CHANGE', at, p)
 
@@ -252,7 +307,7 @@ class Ledger:
             p = self.position(sym)
             if p is None: raise ValueError('Unknown symbol')
             matched = actual == number(p['base_qty']) + number(p['qty'])
-            p['blocked'] = not matched
+            p['operational_blocked'] = not matched
             self._save(p)
             self._event('reconcile:'+symbol(sym)+':'+utc(at).isoformat(), 'RECONCILE', at,
                         dict(actual=str(actual), matched=matched))
@@ -265,7 +320,15 @@ class Ledger:
         entry, stop = number(entry, positive=True), number(stop, positive=True)
         if stop >= entry: return dict(allowed=False, qty='0', reason='INVALID_STOP')
         policy = self.policy
-        if any(number(x['qty']) > 0 and session_day(x['opened_at']) != session_day(at) for x in self.positions()):
+        positions = self.positions()
+        # Account-wide gate BEFORE computing stop-based risk reserves. Never let
+        # an invalid stop turn an unsafe position into a zero-risk reservation.
+        for existing in positions:
+            if number(existing['qty']) > 0 and existing['protection_issues']:
+                return dict(allowed=False, qty='0', reason='UNSAFE_PROTECTION',
+                            blocking_symbol=existing['symbol'],
+                            protection_issues=existing['protection_issues'])
+        if any(number(x['qty']) > 0 and session_day(x['opened_at']) != session_day(at) for x in positions):
             return dict(allowed=False, qty='0', reason='OVERNIGHT_T_REQUIRES_REVIEW')
         if p['blocked'] or p['exit_latched'] or number(p['qty']) > 0:
             return dict(allowed=False, qty='0', reason='POSITION_OR_RECONCILIATION_BLOCK')
@@ -275,7 +338,7 @@ class Ledger:
             return dict(allowed=False, qty='0', reason='DAILY_ENTRY_LIMIT')
         # Existing open stops consume the remaining daily loss budget.
         reserved = ZERO
-        for x in self.positions():
+        for x in positions:
             if number(x['qty']) > 0:
                 if x['stop'] is None: return dict(allowed=False, qty='0', reason='UNPROTECTED_POSITION')
                 reserved += max(ZERO, number(x['avg'])-number(x['stop'])) * number(x['qty'])

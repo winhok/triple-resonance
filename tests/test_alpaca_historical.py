@@ -98,13 +98,10 @@ class _ClientNoop:
         raise AssertionError("不应被调用（timeframe 校验应先失败）")
 
 
-def test_client_from_profile_reads_oauth(tmp_path, monkeypatch):
-    profdir = tmp_path / "profiles"
-    profdir.mkdir()
-    (profdir / "paper.yaml").write_text(
-        "api_key:\nsecret_key:\naccess_token: abc123def\nscopes: trading data\n"
-    )
-    monkeypatch.setattr(ah, "_profile_path", lambda prof: str(profdir / f"{prof}.yaml"))
+def test_client_from_profile_reads_oauth(monkeypatch):
+    # 不碰文件系统：直接让 _read_profile 返回 OAuth profile（避免 tmp_path 被沙箱拦）
+    monkeypatch.setattr(ah, "_read_profile",
+                        lambda profile: {"access_token": "abc123def", "scopes": "trading data"})
     prov = ah.client_from_profile(profile="paper", feed="sip")
     assert isinstance(prov, AlpacaHistoricalProvider)
     assert prov.feed == "sip"

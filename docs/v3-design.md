@@ -3,6 +3,10 @@
 > 状态：分阶段的施工蓝图。**P0 ✅ 已实现**（领域模型 + 状态机 + Session + 定仓 + 本地 SQLite 状态库，
 > 纯本地、无数据依赖、36 项单测全 PASS）；**P1 ✅ 已实现**（Alpaca 历史 1m + Parquet Store，
 > 已拉取 NVDA+SPY 2025-01-02~2026-08-31 的 1m 数据并落地，feed=IEX 元信息完整，见 §10）。
+> **P2 ✅ 已实现**（session 锚定聚合 + MarketContext + Setup A 纯函数）；
+> **P3 ✅ 已实现**（当日 same-day 回测引擎，A/B/C 三基准 + T 系统专属指标，实跑 NVDA/SPY 给出 Signal Contribution +2.30%）；
+> **P4 已实现（观察-only）**：Alpaca 实时数据接入 + 辅助观察层 —— 按用户 2026-09-07 约束
+> **绝不接下单账号、不调用 TradingClient**，买入/卖出由用户手动执行，工具只输出信号建议并记录手动成交。
 > v2.2 的结论（详见 [backtest-report-v2.md](backtest-report-v2.md)）是本设计的前提：
 > **"60m 三指标整仓择时"已被证伪为负贡献（final 超额 -8.44pp），
 > 且它本来就不是当日 T——平均持仓 22 个交易日的波段器被拿去验证"今天买今天卖"。**
@@ -16,11 +20,11 @@ SDK 对象不允许渗透进策略/状态机层（见 §9 包结构）。P0 完�
 ```text
 P0  Domain + Session + T Bucket + Interfaces + StateStore   ✅ 已实现
 P1  Alpaca Historical 1m + Data Store（parquet，含 feed 元信息）  ✅ 已实现
-P2  1m → 5m/15m 聚合（按 session 锚定）+ MarketContext + Setup A（纯函数）
-P3  Same-day Backtester（1m 事件引擎，A/B/C 三基准，Signal Contribution = C−B）
-P4  Alpaca Live WebSocket + Paper Execution（TradingClient，非 Broker API）
-P5  Forward Test
-P6  Setup B / Reverse T
+P2  1m → 5m/15m 聚合（按 session 锚定）+ MarketContext + Setup A（纯函数）  ✅ 已实现
+P3  Same-day Backtester（1m 事件引擎，A/B/C 三基准，Signal Contribution = C−B）  ✅ 已实现
+P4  Alpaca 实时数据 + 辅助观察（观察-only，不下单；TradingClient 不接）  ✅ 已实现
+P5  Forward Test（手动观察，无需下单账号）
+P6  Setup B / Reverse T（后置，独立回测）
 ```
 
 ## 0. 设计原则
@@ -258,13 +262,15 @@ triple_resonance/
 │   ├── sizing.py          # 定仓公式（P0 ✅）
 │   └── stops.py           # 结构止损 + 锁定止损（P2）
 ├── execution/
-│   ├── protocol.py        # ExecutionProvider
-│   ├── paper.py           # P4
-│   └── alpaca.py          # P4（命名 AlpacaExecutionAdapter，非 BrokerClient）
+│   ├── protocol.py        # ExecutionProvider（OrderIntent/Fill 建模）
+│   └── manual.py          # P4（观察-only）：建议单 + 记录手动成交，绝不下单
 ├── state/
 │   └── sqlite.py          # 本地状态库 + reconcile（P0 ✅）
-└── backtest/
-    └── intraday.py        # P3：1m same-day 事件引擎
+├── backtest/
+│   ├── __init__.py
+│   ├── intraday.py        # P3：1m same-day 事件引擎（A/B/C 三基准）
+│   └── run.py             # P3 CLI：python -m triple_resonance.backtest.run
+└── assist.py              # P4：实时辅助观察（流→context→setup→建议，不下单）
 
 # v2 legacy baseline（保留，不删）：
 intraday.py   backtest.py   indicators.py   # 旧三共振仅 observe；新回测在 backtest/intraday.py
@@ -276,13 +282,13 @@ intraday.py   backtest.py   indicators.py   # 旧三共振仅 observe；新回�
 |---|---|---|
 | P0 | Domain + Session + T Bucket + Interfaces + SQLite StateStore（纯本地，无数据依赖） | ✅ 36 项单测 PASS：`tests/test_t_bucket.py`(19)·`test_session.py`(4)·`test_position_sizing.py`(6)·`test_state_store.py`(7)。覆盖 7 条不变式 + effective_cost + 定仓 + reconcile |
 | P1 | Alpaca Historical 1m + Parquet Store（含 feed=IEX/SIP 元信息） | ✅ 已实现 + 实跑验证。`tests/test_parquet_store.py`(round-trip+meta)·`test_alpaca_historical.py`(Bar 转换+oauth profile，无网络) 共 11 项 PASS；`python -m triple_resonance.data.download --symbols NVDA SPY --start 2025-01-01 --end 2026-09-01 --timeframe 1m --feed iex` 落地 `data/alpaca/iex/{NVDA,SPY}/{2025,2026}.parquet` + `meta.json`（NVDA 167,493 / SPY 164,766 根，415 交易日，跨 2025-01-02~2026-08-31）。**注意**：Alpaca `end` 为右开区间，欲含某日需 end≥次日；IEX free 层历史回溯至 2025-01 可用；个别日（如 2025-01-02 SPY）首根落在 10:30 ET 属 IEX 开盘缺口，P2/P3 按 ts 对齐即可 |
-| P2 | 1m→5m/15m 聚合（session 锚定）+ MarketContext + Setup A（纯函数） | 合成/历史信号复盘：每笔 T 的 context/setup/trigger 可解释 |
-| P3 | 1m same-day Backtester（A/B/C 三基准，Signal Contribution=C−B） | 合成数据回归测试 + 通过 §7 门槛 |
-| P4 | Alpaca Live WebSocket + Paper Execution（TradingClient） | 一周模拟盘：T 仓每日清零、无隔夜、reconcile OK |
-| P5 | Forward Test | 用户确认后 |
+| P2 | 1m→5m/15m 聚合（session 锚定）+ MarketContext + Setup A（纯函数） | ✅ `tests/test_aggregator.py`(5)·`test_context.py`(2)·`test_trend_pullback.py`(7) 共 14 项 PASS：session 锚定（09:30/09:45 桶）、OHLCV/vwap、原始 feature、detect 条件全锁死 |
+| P3 | 1m same-day Backtester（A/B/C 三基准，Signal Contribution=C−B） | ✅ `tests/test_backtest.py`(3) 合成数据回归（触发/不触发/flatten 路径）；实跑 NVDA+SPY 2025-01~2026-08 415 日：243 笔 T、胜率 47.7%、PF 1.09、Signal Contrib(C−B) **+2.30%**、vs B&H(C−A) −10.31%（20% 现金袖在 NVDA +63% 牛市必然落后，符合预期） |
+| P4 | Alpaca 实时数据 + 辅助观察（观察-only，不下单） | ✅ `tests/test_alpaca_live.py`(4)·`test_manual_exec.py`(2) 共 6 项 PASS：Bar 转换、subscribe 接线、凭据解析（无 key/secret 明确报错）、建议单、手动成交记录。**约束**：不调用 TradingClient、不建任何订单；`assist.py` 实时流→context→setup→输出 OrderIntent 建议，买卖由用户手动 |
+| P5 | Forward Test（手动观察） | 用户手动执行期间观察信号质量，无需下单账号 |
 | P6 | Setup B / Reverse T | 独立回测通过后再加 |
 
-**在 P3 通过 §7 门槛之前，T_BUY/T_SELL 不恢复输出。**
+**用户 2026-09-07 决策：本工具纯做"辅助做 T"——信号/上下文给你看，买入/卖出动作你自己来；不接任何能下单的账号。** 因此 P4 不含自动执行层，`execution/` 仅保留 `manual.py`（记录手动成交到 StateStore 供对账）。P3 回测结论已用于判断 Setup A 是否有基本 edge（+2.30% over 现金袖），而非用于自动下单。
 
 **P0 关键边界（已锁死）**：flatten 后当日禁止再开 T（隔夜保护）、stop≥entry 拒单、
 空仓卖出/重复入场拒单、费用计入净盈亏、`effective_cost_after_t` 数学正确、

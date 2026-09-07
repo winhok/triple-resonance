@@ -7,6 +7,9 @@ venv/
 .DS_Store
 /data/
 /state.db*
+/state/
+/runtime/macro.json
+/config/accounts.json
 *.egg-info/
 .pytest_cache/
 .env

@@ -9,6 +9,7 @@ venv/
 /state.db*
 /state/
 /runtime/macro.json
+/runtime/forward-tests/
 /config/accounts.json
 *.egg-info/
 .pytest_cache/

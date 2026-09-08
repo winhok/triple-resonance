@@ -159,6 +159,24 @@ def structure_gate(stock_1m: Sequence[Bar], *, min_rvol: float) -> GateResult:
                                                        bars_5m=len(b5), bars_15m=len(b15), bars_60m=len(b60)))
 
 
+def short_structure_gate(stock_1m: Sequence[Bar], *, min_rvol: float) -> GateResult:
+    """Mirror only the structural vetoes needed by the short shadow strategy."""
+    b5, b15, b60 = _aggregate(stock_1m, 5), _aggregate(stock_1m, 15), _aggregate(stock_1m, 60)
+    if len(b5) < 5 or len(b15) < 3:
+        return GateResult(False, ('MULTITIMEFRAME_WARMUP',), {})
+    blocks = []
+    if b15[-1].high > b15[-2].high and b15[-1].low > b15[-2].low:
+        blocks.append('STRUCTURE_15M_BULLISH')
+    if len(b60) >= 2 and b60[-1].high > b60[-2].high and b60[-1].close > b60[-2].close:
+        blocks.append('STRUCTURE_1H_BULLISH')
+    prior = [bar.volume for bar in b5[-5:-1]]
+    rvol = b5[-1].volume / mean(prior) if prior and mean(prior) > 0 else 0
+    if rvol < min_rvol:
+        blocks.append('VOLUME_NOT_CONFIRMED')
+    return GateResult(not blocks, tuple(blocks), dict(rvol_5m=rvol,
+                                                       bars_5m=len(b5), bars_15m=len(b15), bars_60m=len(b60)))
+
+
 def combine(*results: GateResult) -> GateResult:
     blocks=[]; facts={}
     for result in results:

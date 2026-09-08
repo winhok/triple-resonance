@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import pytest
 from triple_resonance.dayt.accounts import load_config, account_blocks
-from triple_resonance.dayt.gates import Quote, quote_gate, macro_gate, MacroSnapshot, rotation_gate, structure_gate
+from triple_resonance.dayt.gates import Quote, quote_gate, macro_gate, MacroSnapshot, rotation_gate, short_structure_gate, structure_gate
 from triple_resonance.domain.models import Bar
 
 UTC=timezone.utc
@@ -35,6 +35,11 @@ def test_structure_rejects_weak_volume():
     xs[-5:]=[Bar(x.symbol,x.ts,x.open,x.high,x.low,x.close,10,x.vwap) for x in xs[-5:]]
     r=structure_gate(xs,min_rvol=1.0)
     assert not r.allowed and 'VOLUME_NOT_CONFIRMED' in r.blocks
+
+def test_short_structure_rejects_bullish_fifteen_minute_trend():
+    xs=bars('QQQ',[100+i*.01 for i in range(45)],100)
+    r=short_structure_gate(xs,min_rvol=1.0)
+    assert not r.allowed and 'STRUCTURE_15M_BULLISH' in r.blocks
 
 def test_two_accounts_must_not_share_db(tmp_path):
     cfg={'schema':1,'accounts':{

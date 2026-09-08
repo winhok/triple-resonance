@@ -113,6 +113,18 @@ t-assist --db state.db export audit/ledger-001.json
 
 ## 回测与适用边界
 
+### 多空纸面 Forward Test
+
+统一 runner 可以用同一份公开 1m 行情并行记录多头账本和独立的做空影子账本：
+
+```bash
+python -m triple_resonance.dayt.forward_test \
+  --output runtime/forward-tests/YYYY-MM-DD \
+  --poll-seconds 60
+```
+
+多头在完整 5m 跌破会话 VWAP 后于下一分钟 Open 模拟退出；空头 Setup B 要求持续的 SPY 弱势、标的相对弱势、开盘区间破位、VWAP rejection、空头多周期结构和 RVOL 确认。空头借券资格、借券费、SSR 和券商保证金均未由公开行情验证，因此只写入 `short-shadow`，不能视为可真实执行。详见 `docs/short-shadow.md`。
+
 ```bash
 python -m triple_resonance.backtest.run --symbol NVDA --spy SPY --feed iex
 python -m triple_resonance.backtest.run --symbol NVDA --t-cash 1000 --fee 1 \

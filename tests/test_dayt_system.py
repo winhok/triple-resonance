@@ -31,7 +31,7 @@ def test_rotation_conflict_for_growth_when_dia_leads():
     assert not r.allowed and 'STYLE_ROTATION_CONFLICT' in r.blocks
 
 def test_structure_rejects_weak_volume():
-    xs=bars('DIA',[100+i*.01 for i in range(30)],100)
+    xs=bars('DIA',[100+i*.01 for i in range(45)],100)
     xs[-5:]=[Bar(x.symbol,x.ts,x.open,x.high,x.low,x.close,10,x.vwap) for x in xs[-5:]]
     r=structure_gate(xs,min_rvol=1.0)
     assert not r.allowed and 'VOLUME_NOT_CONFIRMED' in r.blocks

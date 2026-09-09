@@ -123,7 +123,27 @@ python -m triple_resonance.dayt.forward_test \
   --poll-seconds 60
 ```
 
-多头在完整 5m 跌破会话 VWAP 后于下一分钟 Open 模拟退出；空头 Setup B 要求持续的 SPY 弱势、标的相对弱势、开盘区间破位、VWAP rejection、空头多周期结构和 RVOL 确认。空头借券资格、借券费、SSR 和券商保证金均未由公开行情验证，因此只写入 `short-shadow`，不能视为可真实执行。详见 `docs/short-shadow.md`。
+多头要求 SPY 连续两个完整 5m 收盘站上会话 VWAP 且 VWAP 向上，并在完整 5m 跌破会话 VWAP 后于下一分钟 Open 模拟退出；空头 Setup B 要求持续的 SPY 弱势、标的相对弱势、开盘区间破位、VWAP rejection、空头多周期结构和 RVOL 确认。空头借券资格、借券费、SSR 和券商保证金均未由公开行情验证，因此只写入 `short-shadow`，不能视为可真实执行。详见 `docs/short-shadow.md`。
+
+### 本地实验目录
+
+原始 1m K 保留为 Parquet；每次历史实验保存所选窗口快照、配置、数据质量、成交、指标和内容哈希，并生成供人或 LLM 定位证据的本地索引：
+
+```bash
+python -m triple_resonance.research.catalog_cli \
+  --symbols SPY QQQ DIA IWM NVDA AAPL MSFT AMZN META \
+  --feed iex --start 2026-08-02 --end 2026-09-01
+
+python -m triple_resonance.research.run \
+  --symbols NVDA --benchmark SPY --feed iex \
+  --start 2026-08-02 --end 2026-09-01 \
+  --run-id 2026-08-nvda-30d
+
+python -m triple_resonance.research.verify \
+  research/runs/2026-08-nvda-30d
+```
+
+生成的 `research/index.json`、`research/index.md` 和 `research/runs/` 只保留在本地，不提交行情或实验私有数据。详见 `research/README.md`。
 
 ```bash
 python -m triple_resonance.backtest.run --symbol NVDA --spy SPY --feed iex

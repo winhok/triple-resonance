@@ -64,8 +64,12 @@ def _complete_prefix(bars, session, decision_at):
 
 def simulate(symbol, stock, benchmark, session, now, *, initial_cash=10_000.0,
              risk_pct=.01, target_r=1.5, slippage_bps=5.0,
-             exit_on_vwap_loss=True, detector=None):
+             exit_on_vwap_loss=True, detector=None, source="yahoo_public_1m",
+             min_rvol=1.0, require_spy_persistence=False,
+             min_stop_distance_bps=0.0):
     """Recompute one symbol from all closed bars; allow one round trip per day."""
+    if not math.isfinite(min_stop_distance_bps) or min_stop_distance_bps < 0:
+        raise ValueError("min_stop_distance_bps must be finite and nonnegative")
     slip = slippage_bps / 10_000
     closed_before = min(utc(now), session.close_at)
     stock = sorted([b for b in stock if session.open_at <= utc(b.ts) < closed_before], key=lambda b: b.ts)
@@ -84,7 +88,7 @@ def simulate(symbol, stock, benchmark, session, now, *, initial_cash=10_000.0,
         trades.append({"type": "PAPER_FILL", "side": "sell", "symbol": symbol,
                        "at": utc(bar.ts).isoformat(), "price": price,
                        "quantity": position["quantity"], "reason": reason,
-                       "realized_pnl": pnl, "source": "yahoo_public_1m"})
+                       "realized_pnl": pnl, "source": source})
         position = None
 
     for index, bar in enumerate(stock):
@@ -95,6 +99,14 @@ def simulate(symbol, stock, benchmark, session, now, *, initial_cash=10_000.0,
         if pending is not None and ts == pending["at"] and position is None:
             entry, stop = bar.open * (1 + slip), pending["stop"]
             per_share = entry - stop
+            distance_bps = per_share / entry * 10_000 if entry > 0 else 0
+            if distance_bps < min_stop_distance_bps:
+                decisions.append({"type": "ENTRY_DECISION", "symbol": symbol,
+                                  "at": ts.isoformat(), "status": "COST_HURDLE_BLOCKED",
+                                  "stop_distance_bps": distance_bps,
+                                  "minimum_stop_distance_bps": min_stop_distance_bps})
+                pending = None
+                continue
             qty = min(int(initial_cash * risk_pct / per_share), int(cash / entry)) if per_share > 0 else 0
             if qty > 0:
                 cash -= entry * qty
@@ -104,7 +116,7 @@ def simulate(symbol, stock, benchmark, session, now, *, initial_cash=10_000.0,
                                "at": ts.isoformat(), "price": entry, "quantity": qty,
                                "stop": stop, "target": position["target"],
                                "reason": "next_minute_open_after_setup",
-                               "source": "yahoo_public_1m"})
+                               "source": source})
                 traded = True
             pending = None
         if position is not None:
@@ -144,13 +156,20 @@ def simulate(symbol, stock, benchmark, session, now, *, initial_cash=10_000.0,
             result = decide(stock[:index], [by_benchmark[t] for t in sorted(by_benchmark) if t < ts],
                             session, ts, now=ts, max_age_seconds=90, rs_threshold=0,
                             detector=detector)
-            structure = structure_gate(stock[:index], min_rvol=1.0)
+            structure = structure_gate(stock[:index], min_rvol=min_rvol)
+            persistence = _long_persistence(
+                [by_benchmark[t] for t in sorted(by_benchmark) if t < ts], session, ts
+            )
+            blocks = list(structure.blocks)
+            if require_spy_persistence and not persistence:
+                blocks.append("SPY_UPTREND_NOT_PERSISTENT")
             row = {"type": "DECISION", "symbol": symbol, "at": ts.isoformat(),
                    "status": result.status, "reason": result.reason,
-                   "structure_gate": asdict(structure)}
+                   "structure_gate": asdict(structure), "blocks": blocks,
+                   "spy_uptrend_persistent": persistence}
             if result.context is not None:
                 row["context"] = asdict(result.context)
-            if result.signal is not None and structure.allowed:
+            if result.signal is not None and not blocks:
                 row["signal"] = asdict(result.signal)
                 pending = {"at": ts + timedelta(minutes=1), "stop": result.signal.structural_stop}
             elif result.signal is not None:
@@ -180,9 +199,23 @@ def _short_persistence(benchmark, session, decision_at):
             and current_vwap < previous_vwap)
 
 
+def _long_persistence(benchmark, session, decision_at):
+    if len(benchmark) < 10 or not _complete_prefix(benchmark, session, decision_at):
+        return False
+    previous = benchmark[:-5]
+    try:
+        current_vwap, previous_vwap = vwap(benchmark), vwap(previous)
+    except ValueError:
+        return False
+    return (benchmark[-1].close > current_vwap
+            and previous[-1].close > previous_vwap
+            and current_vwap > previous_vwap)
+
+
 def simulate_short(symbol, stock, benchmark, session, now, *, initial_cash=10_000.0,
                    risk_pct=.01, target_r=1.5, slippage_bps=5.0,
-                   exit_on_vwap_reclaim=True, detector=None):
+                   exit_on_vwap_reclaim=True, detector=None,
+                   source="yahoo_public_1m"):
     """Research-only short book; short proceeds are never treated as cash."""
     slip = slippage_bps / 10_000
     closed_before = min(utc(now), session.close_at)
@@ -200,7 +233,7 @@ def simulate_short(symbol, stock, benchmark, session, now, *, initial_cash=10_00
         trades.append({"type": "PAPER_FILL", "side": "buy_to_cover", "symbol": symbol,
                        "at": utc(bar.ts).isoformat(), "price": price,
                        "quantity": position["quantity"], "reason": reason,
-                       "realized_pnl": pnl, "source": "yahoo_public_1m",
+                       "realized_pnl": pnl, "source": source,
                        "book": "short-shadow"})
         position = None
 
@@ -220,7 +253,7 @@ def simulate_short(symbol, stock, benchmark, session, now, *, initial_cash=10_00
                                "at": ts.isoformat(), "price": entry, "quantity": qty,
                                "stop": stop, "target": position["target"],
                                "reason": "next_minute_open_after_short_setup",
-                               "source": "yahoo_public_1m", "book": "short-shadow",
+                               "source": source, "book": "short-shadow",
                                "borrow_status": "NOT_VERIFIED_RESEARCH_ONLY"})
                 traded = True
             pending = None
@@ -320,7 +353,10 @@ def run(output, *, poll_seconds=60, once=False):
         decisions, fills, summaries = [], [], []
         short_decisions, short_fills, short_summaries = [], [], []
         for symbol in candidates:
-            ds, fs, summary = simulate(symbol, complete[symbol], complete["SPY"], session, now)
+            ds, fs, summary = simulate(
+                symbol, complete[symbol], complete["SPY"], session, now,
+                require_spy_persistence=True
+            )
             decisions.extend(ds); fills.extend(fs); summaries.append(summary)
             sds, sfs, short_summary = simulate_short(
                 symbol, complete[symbol], complete["SPY"], session, now
@@ -339,7 +375,8 @@ def run(output, *, poll_seconds=60, once=False):
                    "assumptions": {"initial_cash_per_candidate": 10000, "risk_pct": .01,
                                    "target_r": 1.5, "slippage_bps_each_side": 5,
                                    "entry": "next_minute_open", "intrabar_ambiguity": "stop_first",
-                                   "exit": "earliest_of_vwap_loss_next_open_stop_target_time"},
+                                   "exit": "earliest_of_vwap_loss_next_open_stop_target_time",
+                                   "require_spy_uptrend_persistence": True},
                    "symbols": summaries,
                    "portfolio_total_pnl": sum(x["total_pnl"] for x in summaries)}
         _atomic_lines(output / "bars.ndjson", sorted(bar_rows, key=lambda x: (str(x["ts"]), x["symbol"])))

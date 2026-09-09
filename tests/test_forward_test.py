@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 
 from triple_resonance.assistant.calendar import Session
 from triple_resonance.dayt import forward_test
@@ -49,6 +50,21 @@ def test_vwap_loss_exits_at_next_minute_open():
     assert trades[1]["reason"] == "vwap_exit"
     assert trades[1]["at"] == (start + timedelta(minutes=51)).isoformat()
     assert any(item["type"] == "EXIT_DECISION" for item in decisions)
+
+    blocked, blocked_trades, _ = simulate(
+        "QQQ", stock, benchmark, session, start + timedelta(minutes=52),
+        detector=detector, require_spy_persistence=True
+    )
+    assert blocked_trades == []
+    assert any("SPY_UPTREND_NOT_PERSISTENT" in item.get("blocks", [])
+               for item in blocked)
+
+    cost_blocks, cost_blocked_trades, _ = simulate(
+        "QQQ", stock, benchmark, session, start + timedelta(minutes=52),
+        detector=detector, min_stop_distance_bps=2_000
+    )
+    assert cost_blocked_trades == []
+    assert any(item.get("status") == "COST_HURDLE_BLOCKED" for item in cost_blocks)
 
 
 def test_incomplete_prefix_cannot_trigger_vwap_exit():
@@ -129,6 +145,7 @@ def test_runner_writes_separate_books_and_combined_summary(tmp_path, monkeypatch
     short_summary = (tmp_path / "short-summary.json").read_text()
     combined = (tmp_path / "combined-summary.json").read_text()
     assert '"type":"FORWARD_TEST_SUMMARY"' in long_summary
+    assert json.loads(long_summary)["assumptions"]["require_spy_uptrend_persistence"] is True
     assert '"type":"SHORT_SHADOW_SUMMARY"' in short_summary
     assert '"borrow_status":"NOT_VERIFIED_RESEARCH_ONLY"' in short_summary
     assert '"books_netted":false' in combined

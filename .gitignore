@@ -10,6 +10,13 @@ venv/
 /state/
 /runtime/macro.json
 /runtime/forward-tests/
+/research/index.json
+/research/index.md
+/research/dataset-catalog.json
+/research/yahoo-8d-dataset-catalog.json
+/research/massive-6m-dataset-catalog.json
+/research/massive-1y-dataset-catalog.json
+/research/runs/
 /config/accounts.json
 *.egg-info/
 .pytest_cache/

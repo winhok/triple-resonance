@@ -18,13 +18,17 @@ from ..domain.models import Bar
 
 
 class ParquetStore:
-    def __init__(self, root='data'):
+    def __init__(self, root='data', provider='alpaca'):
+        if provider not in ('alpaca', 'massive'):
+            raise ValueError('Invalid provider')
         self.root = str(root)
+        self.provider = provider
 
     def _feed_dir(self, feed):
-        if feed not in ('iex', 'sip', 'otc'):
+        allowed = ('iex', 'sip', 'otc') if self.provider == 'alpaca' else ('sip',)
+        if feed not in allowed:
             raise ValueError('Invalid feed')
-        return Path(self.root) / 'alpaca' / feed
+        return Path(self.root) / self.provider / feed
 
     def _symbol_dir(self, feed, symbol):
         return str(self._feed_dir(feed) / normalize_symbol(symbol))
@@ -129,7 +133,7 @@ class ParquetStore:
                 rows += count
             digest = hashlib.sha256(json.dumps({'feed': feed, 'timeframe': timeframe,
                                                'files': hashes}, sort_keys=True).encode()).hexdigest()
-            meta = dict(provider='alpaca', feed=feed, timeframe=timeframe, symbols=sorted(files),
+            meta = dict(provider=self.provider, feed=feed, timeframe=timeframe, symbols=sorted(files),
                         start=min(edges).isoformat() if edges else str(start),
                         end=(max(edges) + timedelta(minutes=1)).isoformat() if edges else str(end),
                         end_semantics='exclusive', request_start=str(start), request_end=str(end),
